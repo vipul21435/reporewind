@@ -119,6 +119,48 @@ commit, then exports the result as a schema-validated task bundle.
     the image and runs the demo in it. Slice 8 still owns compose, the API
     image, the e2e CI job and committed bundles for public repositories.
 
+- **Slice 3 decisions (recipes).**
+  - A `Recipe` holds only values that change the environment, normalized so
+    equivalent recipes hash equal (canonical `SpecifierSet`, PEP 685 extras,
+    PEP 508 requirement strings, sorted system packages and env). The hash
+    is `sha256:` of `{"schema_version": 1, "recipe": ...}` as sorted,
+    compact, ASCII JSON; a test pins the default recipe's hash.
+  - Recipe files keep two layers: `detected` (commit, backend, sources,
+    notes, and a *sparse* recipe with only the fields that had evidence) and
+    hand-written `overrides`. Sparse detection matters: an override of
+    `test_framework` then brings that framework's default command instead
+    of keeping the detected one. Overrides use JSON Merge Patch (RFC 7396)
+    rather than an ad-hoc deep merge, so `null` has one documented meaning.
+  - Detection reads blobs with `git cat-file` at the base commit (the
+    plumbing form of `git show REV:PATH`, without textconv), so it works in
+    the bare cache and ignores the work tree. `setup.py` is only parsed with
+    `ast`: literals, module-level names bound to literals, and `+` of lists
+    or strings; everything else becomes a note.
+  - Precedence for the Python constraint: `[project] requires-python`,
+    Poetry's `python`, legacy flit metadata, `setup.cfg`, `setup.py`;
+    disagreements are noted. Test dependencies come from PEP 735 groups
+    (`test`/`tests`/`testing`, else `dev`), Poetry groups, hatch envs,
+    `tests_require` and tox `deps`; extras from tox (`extras`, `.[x]`) plus
+    test-named extras. Requirements files: root `requirements.txt`, then
+    test files (or dev/ci files if there are none), plus tox `-r` files;
+    docs, lint and typing files are skipped.
+  - Framework: pytest with any evidence (config sections, `pytest.ini`,
+    `conftest.py`, tox commands, test files importing pytest or defining
+    plain `test_` functions), unittest with only unittest evidence, pytest
+    by default. If pytest is chosen but declared nowhere it is added
+    unpinned; slice 4 dates it with `--exclude-newer`.
+  - Backends without PEP 660 editable installs (`poetry.masonry.api`,
+    `flit.buildapi`) get `install: package`; C/Cython sources or an
+    `Extension` add `build-essential`; Rust backends only get a note.
+  - Known gap for slice 5: projects whose version comes from VCS metadata
+    (attrs uses `hatch-vcs`) need the `.git` directory or
+    `SETUPTOOLS_SCM_PRETEND_VERSION` in the image; detection does not flag
+    this yet.
+  - `recipes/pallets__markupsafe.yaml` and `recipes/python-attrs__attrs.yaml`
+    are real detector output at the bases of markupsafe#477 and attrs#1606;
+    an offline test validates every committed recipe and an `e2e` test
+    re-detects them from GitHub and compares the `detected` layer.
+
 ## Target layout
 
 ```
@@ -148,7 +190,7 @@ tests, green lint (ruff), strict typecheck (mypy) and a green suite.
 
 2. [x] **Commit resolver and diff splitter** (done 2026-09-29) - From a repo URL plus fix SHA, resolve the parent commit (reject root commits; require an explicit mainline for merge commits), compute the fix diff and split it per file into a source patch and a test patch using configurable path rules (`tests/`, `test_*.py`, `*_test.py`, `conftest.py`), handling adds, deletes, renames and binary files, and prove both patches apply cleanly to the parent. Resolve a GitHub PR number to its fix/base commits through the REST API (httpx with an injectable transport, recorded JSON fixtures, optional `GITHUB_TOKEN`). Expose `reporewind resolve` that prints or writes the `ResolvedFix` JSON.
 
-3. [ ] **Build recipes: schema, detection and store** - Define a pydantic `Recipe` (Python constraint, install mode, extras, requirements files, system packages, pre-install steps, test command, test framework, env) and detectors that read `pyproject.toml` (PEP 621, setuptools, poetry, hatch, flit), `setup.py` (parsed with `ast`, never executed), `setup.cfg`, `requirements*.txt` and `tox.ini` at the parent commit via `git show`. Store recipes as `recipes/<owner>__<repo>.yaml` where human overrides deep-merge over detected values and the result is validated; add a stable recipe hash (sha256 of canonical JSON) and `reporewind recipe detect|show|validate`.
+3. [x] **Build recipes: schema, detection and store** (done 2026-09-29) - Define a pydantic `Recipe` (Python constraint, install mode, extras, requirements files, system packages, pre-install steps, test command, test framework, env) and detectors that read `pyproject.toml` (PEP 621, setuptools, poetry, hatch, flit), `setup.py` (parsed with `ast`, never executed), `setup.cfg`, `requirements*.txt` and `tox.ini` at the parent commit via `git show`. Store recipes as `recipes/<owner>__<repo>.yaml` where human overrides deep-merge over detected values and the result is validated; add a stable recipe hash (sha256 of canonical JSON) and `reporewind recipe detect|show|validate`.
 
 4. [ ] **Historical pinning: Python version, dependencies, base image** - Infer the Python version from `requires-python`, trove classifiers and a commit-date table of CPython release dates (newest release that existed at the commit and satisfies the constraints). Resolve dependencies as of the commit date with `uv pip compile --exclude-newer <commit-date> --python-version X.Y` behind a `CommandRunner` protocol (fake in unit tests). Resolve `python:X.Y-slim` to an immutable `@sha256:` digest via `docker buildx imagetools inspect`, with an offline fallback table and `REPOREWIND_OFFLINE`. Expose `reporewind pin`, which writes the lock file and a `PinResult`.
 

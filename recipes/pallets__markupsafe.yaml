@@ -1,0 +1,26 @@
+# RepoRewind build recipe.
+# `detected` is rewritten by `reporewind recipe detect`; put changes in
+# `overrides`, a JSON Merge Patch (RFC 7396) over `detected.recipe`:
+# mappings merge, lists and scalars replace, null removes a detected value.
+schema_version: 1
+repo: pallets/markupsafe
+detected:
+  commit: 9c44ecf45141f691d373a66ce664c43b5a6cc761
+  backend: setuptools
+  sources:
+  - pyproject.toml
+  - setup.py
+  - tox.ini
+  - requirements/tests.txt
+  notes:
+  - 'pytest: pyproject.toml [tool.pytest]'
+  - 'compiler toolchain added: setup.py builds an Extension'
+  recipe:
+    python: '>=3.9'
+    install: editable
+    requirements_files:
+    - requirements/tests.txt
+    test_framework: pytest
+    system_packages:
+    - build-essential
+overrides: {}

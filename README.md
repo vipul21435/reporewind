@@ -8,13 +8,15 @@ Rebuild an open-source Python repository at any historical commit inside a
 digest-pinned Docker image, then prove that a fix commit flips its tests from
 failing to passing.
 
-> **Status.** The first pipeline stage, **resolve**, is complete: a fix
-> commit or a merged GitHub pull request becomes a base commit plus a source
-> patch and a test patch, with a proof that the split is exact. It ships
+> **Status.** The first two pipeline stages are complete. **Resolve**: a
+> fix commit or a merged GitHub pull request becomes a base commit plus a
+> source patch and a test patch, with a proof that the split is exact.
+> **Recipe**: the base commit's packaging metadata becomes a validated build
+> recipe, stored as YAML with human overrides and a stable hash. They ship
 > with a hermetic git layer, an offline demo and a digest-pinned CLI image.
-> Recipe detection, historical pinning, environment builds, automated
-> fail-to-pass verification and bundle export are **not built yet**; they
-> are listed under [Roadmap](#roadmap) and tracked in [PLAN.md](PLAN.md).
+> Historical pinning, environment builds, automated fail-to-pass
+> verification and bundle export are **not built yet**; they are listed
+> under [Roadmap](#roadmap) and tracked in [PLAN.md](PLAN.md).
 
 ## Why this exists
 
@@ -59,6 +61,29 @@ are included.
 - **Hermetic git layer**: no shell, no user or system git config, option-like
   revisions rejected before git runs; a diff made on a laptop and one made in
   CI are byte-identical.
+- **Detect a build recipe** (`reporewind recipe detect OWNER/REPO FIX`):
+  read the packaging metadata **at the fix's parent commit** straight from
+  the object store (no checkout) and derive the Python constraint, install
+  mode, extras, requirements files, test dependencies, compiler packages,
+  test framework, test command and test environment. Detectors cover
+  `pyproject.toml` (PEP 621, the setuptools, poetry, hatch, flit and pdm
+  backends, PEP 735 dependency groups, Poetry `^`/`~` constraints translated
+  to PEP 440, hatch environments), `setup.py`, `setup.cfg`,
+  `requirements*.txt` and `tox.ini`.
+- **`setup.py` is never executed**: it is parsed with `ast`; literal
+  arguments, names bound to literals and list concatenation are read, and
+  anything computed at run time is reported as a note instead of guessed.
+- **Recipes as reviewable YAML** (`recipes/<owner>__<repo>.yaml`): a
+  `detected` layer (commit, backend, files read, notes) and hand-written
+  `overrides` that survive re-detection. Overrides are a JSON Merge Patch
+  (RFC 7396): maps merge, lists replace, `null` removes a detected value.
+  Duplicate YAML keys, unknown fields and invalid values are rejected with
+  their location (exit code 11).
+- **Stable recipe hash**: sha256 of the canonical JSON of the effective
+  recipe, independent of key order, YAML formatting and which layer a
+  value came from (a test pins the hash of the default recipe).
+  `reporewind recipe show` prints the merged recipe and its hash;
+  `reporewind recipe validate` checks every committed recipe.
 - **Offline demo and CLI image**: `make demo` runs the whole resolve story on
   a bundled sample repository in a few seconds; `make docker-demo` runs the
   same demo inside a non-root image built on a digest-pinned base.
@@ -186,6 +211,137 @@ $ jq '{pr_number, fix: .fix.sha, base: .base.sha,
 }
 ```
 
+### Build recipes
+
+The recipe is read at the commit that will be built: the parent of the fix
+(`--mainline` picks it for a merge commit, `--at-rev` reads the given
+commit itself). The two recipes committed under [`recipes/`](recipes) were
+written by these commands (run from the repository root on 2026-09-29):
+
+```console
+$ reporewind recipe detect pallets/markupsafe e85aff4d878aa458d5c1e879bf475d8483647f71 --mainline 1
+detected pallets/markupsafe recipe at 9c44ecf45141 (parent 1 of 2 of e85aff4d878a)
+  backend  setuptools
+  sources  pyproject.toml, setup.py, tox.ini, requirements/tests.txt
+  note     pytest: pyproject.toml [tool.pytest]
+  note     compiler toolchain added: setup.py builds an Extension
+  hash     sha256:de7c01a6a3100f122eacdb42330a00cc37058137964d09e690a1264de3d1736f
+  wrote    recipes/pallets__markupsafe.yaml
+
+$ reporewind recipe detect python-attrs/attrs f53fc5440d7f86aac4328aec7a563eb48634177f
+detected python-attrs/attrs recipe at f38b8a3f1625 (parent 1 of 1 of f53fc5440d7f)
+  backend  hatch
+  sources  pyproject.toml, tox.ini
+  note     pytest: pyproject.toml [tool.pytest]
+  hash     sha256:99e289ae6268ad15022f392b296087fed505b0c7c699b49843f09912c0d117b2
+  wrote    recipes/python-attrs__attrs.yaml
+
+$ cat recipes/python-attrs__attrs.yaml
+# RepoRewind build recipe.
+# `detected` is rewritten by `reporewind recipe detect`; put changes in
+# `overrides`, a JSON Merge Patch (RFC 7396) over `detected.recipe`:
+# mappings merge, lists and scalars replace, null removes a detected value.
+schema_version: 1
+repo: python-attrs/attrs
+detected:
+  commit: f38b8a3f1625060aa4245930822c34c11c252f83
+  backend: hatch
+  sources:
+  - pyproject.toml
+  - tox.ini
+  notes:
+  - 'pytest: pyproject.toml [tool.pytest]'
+  recipe:
+    python: '>=3.10'
+    install: editable
+    test_framework: pytest
+    test_dependencies:
+    - cloudpickle; platform_python_implementation == "CPython"
+    - hypothesis
+    - pympler
+    - pytest>9
+    - pytest-xdist[psutil]
+overrides: {}
+```
+
+The attrs test dependencies come from its PEP 735 `tests` dependency group;
+markupsafe's come from the pinned `requirements/tests.txt` that its
+`tox.ini` installs, and its C speedups add `build-essential`. Only fields
+with evidence are stored; the rest take the schema defaults. `make e2e`
+re-detects both recipes from the live repositories and checks that they
+match the committed files.
+
+Overrides are edited by hand and kept when the recipe is detected again.
+On the offline sample repository (after `REPOREWIND_DEMO_WORK=$PWD/w make demo && cd w`),
+detection finds `unittest`; this override switches the runner to pytest and
+drops the detected command so the framework default applies:
+
+```console
+$ reporewind recipe detect example/slugkit fix-separators --repo-dir slugkit.git
+detected example/slugkit recipe at 712f042982ab (parent 1 of 1 of cd84329fdd59)
+  backend  setuptools
+  sources  pyproject.toml
+  note     unittest: test files use unittest.TestCase
+  hash     sha256:05a71b0892dfea9f9f6748ac8024f8cd63e1ab9552c158c4bc1750c4341c05e6
+  wrote    recipes/example__slugkit.yaml
+
+$ tail -7 recipes/example__slugkit.yaml     # after editing the overrides
+overrides:
+  test_framework: pytest
+  test_command: null
+  test_dependencies:
+  - pytest
+  env:
+    PYTHONHASHSEED: '0'
+
+$ reporewind recipe detect example/slugkit fix-separators --repo-dir slugkit.git
+detected example/slugkit recipe at 712f042982ab (parent 1 of 1 of cd84329fdd59)
+  backend  setuptools
+  sources  pyproject.toml
+  note     unittest: test files use unittest.TestCase
+  hash     sha256:822941a4cae76f809a10d47996820083d9e6bd52ee3a0056e8023f1adbb6a44b (4 overrides kept: env, test_command, test_dependencies, test_framework)
+  wrote    recipes/example__slugkit.yaml
+
+$ reporewind recipe show example/slugkit
+repo: example/slugkit
+recipe_hash: sha256:822941a4cae76f809a10d47996820083d9e6bd52ee3a0056e8023f1adbb6a44b
+detected_at: 712f042982ab32bf105c9d3e0b8619ad4b4cd35e
+overridden:
+- env
+- test_command
+- test_dependencies
+- test_framework
+recipe:
+  python: '>=3.9'
+  install: editable
+  extras: []
+  requirements_files: []
+  test_dependencies:
+  - pytest
+  system_packages: []
+  pre_install: []
+  test_framework: pytest
+  test_command:
+  - python
+  - -m
+  - pytest
+  - -rA
+  env:
+    PYTHONHASHSEED: '0'
+
+$ sed -i '' 's/PYTHONHASHSEED/1BAD/' recipes/example__slugkit.yaml
+$ reporewind recipe validate; echo "exit $?"
+invalid  recipes/example__slugkit.yaml: recipe for example/slugkit (detected + overrides) is invalid: env: Value error, invalid environment variable name '1BAD'
+error: 1 recipe file failed validation
+exit 11
+```
+
+Recipe fields: `python` (PEP 440 constraint), `install` (`editable`,
+`package` for backends without editable installs, `requirements`, `none`),
+`extras`, `requirements_files`, `test_dependencies` (PEP 508),
+`system_packages` (Debian), `pre_install` (shell steps), `test_framework`
+(`pytest` or `unittest`), `test_command` (argv) and `env`.
+
 ### Command reference
 
 | Command | What it does |
@@ -197,12 +353,18 @@ $ jq '{pr_number, fix: .fix.sha, base: .base.sha,
 | `--test-dir`, `--test-file`, `--include`, `--exclude` | Override the split rules (defaults: `tests/`, `test/`, `test_*.py`, `*_test.py`, `tests.py`, `conftest.py`) |
 | `-o / --output FILE`, `-q / --quiet` | Write JSON to a file; drop the stderr summary |
 | `--cache-dir DIR`, `--source URL` | Cache location (default `$REPOREWIND_HOME`); fetch from a mirror |
+| `reporewind recipe detect OWNER/REPO FIX` | Detect the recipe at the fix's parent and write `recipes/<owner>__<repo>.yaml`, keeping overrides |
+| `--at-rev`, `-m / --mainline N`, `-n / --dry-run` | Read at FIX itself; pick a merge parent; print the file instead of writing it |
+| `--repo-dir`, `--source`, `--cache-dir`, `--recipes-dir` | Same repository options as `resolve`; recipe directory (default `recipes`) |
+| `reporewind recipe show OWNER/REPO [--json]` | Print the effective recipe (detected + overrides), its hash and the overridden fields |
+| `reporewind recipe validate [FILE...]` | Validate the given recipe files, or every `*.yaml` in `--recipes-dir` |
 | `reporewind version` / `--version` | Print the version |
 
 Exit codes: 0 success, 2 bad input (invalid repo reference, split rule, or a
 short SHA without `--repo-dir`), 3 missing tool (git not on `PATH`), 4 failed
 git command, 10 resolve error (root commit, merge without a mainline, no test
-changes, unmerged PR, GitHub API error).
+changes, unmerged PR, GitHub API error), 11 recipe error (invalid recipe
+file or override, missing recipe).
 
 ### Docker
 
@@ -231,7 +393,11 @@ flowchart LR
     DIFF --> SPLIT["split_patches<br/>SplitRules: source vs test"]
     SPLIT --> PROOF["prove_split<br/>scratch index: each half applies,<br/>base + both == fix tree"]
     PROOF --> JSON["ResolvedFix JSON<br/>byte-exact ASCII"]
-    JSON -.->|roadmap| NEXT["recipe, pin, build,<br/>verify, export"]
+    BASE --> DETECT["detect_recipe at base<br/>pyproject, setup.py (ast), setup.cfg,<br/>requirements, tox.ini"]
+    DETECT --> STORE["recipes/owner__repo.yaml<br/>detected + overrides (RFC 7396)"]
+    STORE --> RECIPE["validated Recipe<br/>sha256 recipe hash"]
+    JSON -.->|roadmap| NEXT["pin, build,<br/>verify, export"]
+    RECIPE -.->|roadmap| NEXT
 ```
 
 | Module | Responsibility |
@@ -243,6 +409,11 @@ flowchart LR
 | `reporewind.resolve.split` | `SplitRules` and the source/test split |
 | `reporewind.resolve.resolver` | Base selection and the scratch-index tree-id proof |
 | `reporewind.resolve.serialize` | Byte-exact `ResolvedFix` JSON (dump and load) |
+| `reporewind.recipes.model` | `Recipe` schema, JSON Merge Patch, canonical JSON and `recipe_hash` |
+| `reporewind.recipes.detect` | Detectors for `pyproject.toml`, `setup.py` (ast), `setup.cfg`, requirements files, `tox.ini` |
+| `reporewind.recipes.poetry` | Poetry constraints and dependency tables to PEP 440 / PEP 508 |
+| `reporewind.recipes.source` | Read-only tree at a commit (object store, no checkout) or in memory |
+| `reporewind.recipes.store` | YAML recipe files: strict loading, validation, atomic writes |
 | `reporewind.gitops` | No-shell `Git` wrapper: fetch by SHA, diff, apply, scratch-index apply, worktrees |
 | `reporewind.models` / `errors` / `proc` | Frozen pydantic v2 models, typed error hierarchy, `CommandRunner` protocol |
 | `reporewind.testing` | `RepoFactory`: deterministic throwaway repositories (fixed identity and clock) |
@@ -254,14 +425,14 @@ produced each number is next to it.
 
 | What | Result | Command |
 |---|---|---|
-| Offline test suite | 300 passed, 2 deselected (e2e) | `make cov` |
-| Branch-inclusive coverage | 99.87% (gate: 85%) | `make cov` |
-| Network end-to-end tests (live GitHub API and git remotes) | 2 passed | `make e2e` |
+| Offline test suite | 399 passed, 4 deselected (e2e) | `make cov` |
+| Branch-inclusive coverage | 99.19% (gate: 85%) | `make cov` |
+| Network end-to-end tests (live GitHub API, git remotes, recipe re-detection) | 4 passed | `make e2e` |
 | Offline demo, wall clock | 3 s | `make demo` |
 | Cache size after resolving attrs#1606 vs a full bare clone | 1.0M vs 6.2M | `du -sh` on `$REPOREWIND_HOME/repos/github.com/*` and on `git clone --bare` |
 | Same for markupsafe#477 | 396K vs 1.2M | as above |
 | Image layers added on top of `python:3.12-slim` | git 109MB, venv 30MB | `docker history reporewind:local` |
-| Source / test code size | 2648 / 2693 lines | `wc -l src/reporewind/*.py src/reporewind/resolve/*.py` and `wc -l tests/*.py` |
+| Source / test code size | 4309 / 3800 lines | `wc -l src/reporewind/*.py src/reporewind/*/*.py` and `wc -l tests/*.py` |
 
 CI (GitHub Actions) runs ruff, ruff format, `mypy --strict` and the coverage
 suite on every push and pull request, and a second job builds the image and
@@ -292,6 +463,15 @@ runs the demo inside it.
   repositories with `repo_factory`; GitHub responses are recorded from the
   live API and replayed. Anything needing the network or Docker is marked
   `e2e` and runs with `make e2e`.
+- **Never run repository code to learn how to build it.** Recipes are
+  read from blobs at the base commit; `setup.py` is parsed with `ast`, and a
+  value that only exists when it runs becomes a note for a human, not a
+  guess. A test feeds a `setup.py` whose first statement raises.
+- **Detected and human layers stay separate.** Re-detection rewrites only
+  `detected`; overrides are a JSON Merge Patch, so a reviewer's intent
+  ("drop this", "replace that list") is explicit and survives upgrades of
+  the detectors. The hash covers the effective recipe only, so moving a
+  value between layers does not change it.
 - **Bundled demo data as text.** The sample repository is a `git
   fast-import` stream rather than a binary bundle, so it is reviewable in a
   diff and regenerated deterministically by `make sample`.
@@ -303,28 +483,23 @@ runs the demo inside it.
 Planned, **not built yet** (details and acceptance criteria in
 [PLAN.md](PLAN.md)):
 
-1. **Build recipes** - a pydantic `Recipe` plus detectors for
-   `pyproject.toml` (PEP 621, setuptools, poetry, hatch, flit), `setup.py`
-   (parsed with `ast`, never executed), `setup.cfg`, `requirements*.txt` and
-   `tox.ini`; YAML recipes with deep-merged human overrides and a stable
-   recipe hash.
-2. **Historical pinning** - infer the Python version from `requires-python`,
+1. **Historical pinning** - infer the Python version from `requires-python`,
    classifiers and CPython release dates; resolve dependencies as of the
    commit date with `uv pip compile --exclude-newer`; resolve
    `python:X.Y-slim` to a digest with an offline fallback table.
-3. **Environment builds** - deterministic Dockerfile per task, images tagged
+2. **Environment builds** - deterministic Dockerfile per task, images tagged
    by a content hash of recipe + lock + base digest, a JSON build-cache index
    and a cross-process build lock.
-4. **Automated verification** - JUnit XML parsing, local and Docker
+3. **Automated verification** - JUnit XML parsing, local and Docker
    executors, the fail-to-pass protocol with FAIL_TO_PASS / PASS_TO_PASS
    lists and a verdict, and flaky-test detection by re-runs.
-5. **Task bundles and service** - schema-validated `task.json`, patches,
+4. **Task bundles and service** - schema-validated `task.json`, patches,
    test lists, lock and a sha256 manifest; `reporewind run` end to end; a
    small FastAPI service with a job queue.
-6. **Compose and public demos** - `docker-compose.yml` for the API, a
+5. **Compose and public demos** - `docker-compose.yml` for the API, a
    manually triggered CI job for the e2e tests, and committed bundles for
    1-2 real public repositories.
-7. **Benchmarks and docs** - throughput and cold vs warm build timings under
+6. **Benchmarks and docs** - throughput and cold vs warm build timings under
    `bench/`, `docs/` pages and a changelog.
 
 ## Development
@@ -333,7 +508,7 @@ Planned, **not built yet** (details and acceptance criteria in
 make install          # uv sync --locked + pre-commit hooks
 make lint typecheck   # ruff check + ruff format --check, mypy --strict on src/
 make cov              # offline suite with branch coverage (fails under 85%)
-make e2e              # network tests (live GitHub API)
+make e2e              # network tests (live GitHub API, recipe re-detection)
 make sample           # regenerate demo/slugkit.fi from demo/make_sample.py
 ```
 

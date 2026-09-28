@@ -1,0 +1,25 @@
+# RepoRewind build recipe.
+# `detected` is rewritten by `reporewind recipe detect`; put changes in
+# `overrides`, a JSON Merge Patch (RFC 7396) over `detected.recipe`:
+# mappings merge, lists and scalars replace, null removes a detected value.
+schema_version: 1
+repo: python-attrs/attrs
+detected:
+  commit: f38b8a3f1625060aa4245930822c34c11c252f83
+  backend: hatch
+  sources:
+  - pyproject.toml
+  - tox.ini
+  notes:
+  - 'pytest: pyproject.toml [tool.pytest]'
+  recipe:
+    python: '>=3.10'
+    install: editable
+    test_framework: pytest
+    test_dependencies:
+    - cloudpickle; platform_python_implementation == "CPython"
+    - hypothesis
+    - pympler
+    - pytest>9
+    - pytest-xdist[psutil]
+overrides: {}
