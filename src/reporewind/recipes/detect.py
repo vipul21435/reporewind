@@ -52,6 +52,13 @@ from reporewind.recipes.model import (
 )
 from reporewind.recipes.poetry import poetry_constraint, poetry_requirement
 from reporewind.recipes.source import GitTreeSource, TreeSource
+from reporewind.recipes.static import UNKNOWN as _UNKNOWN
+from reporewind.recipes.static import callee as _callee
+from reporewind.recipes.static import lines as _lines
+from reporewind.recipes.static import literal as _literal
+from reporewind.recipes.static import module_literals as _module_literals
+from reporewind.recipes.static import strings as _strings
+from reporewind.recipes.static import table as _table
 
 TEST_NAMES = frozenset({"test", "tests", "testing"})
 """Extras, dependency groups and hatch environments that hold test dependencies."""
@@ -85,7 +92,6 @@ _IMPORTS_PYTEST = re.compile(r"^\s*(?:import pytest\b|from pytest\b)", re.MULTIL
 _TEST_FUNCTION = re.compile(r"^def test_", re.MULTILINE)
 _TEST_CASE = re.compile(r"\bTestCase\b")
 _NATIVE_SUFFIXES = (".pyx", ".c", ".cpp", ".cc")
-_UNKNOWN = object()
 
 
 class Detection(BaseModel):
@@ -173,32 +179,6 @@ class _Scan:
 
 
 # -- small helpers ------------------------------------------------------------
-
-
-def _table(data: Mapping[str, Any] | None, *keys: str) -> dict[str, Any]:
-    """``data[k1][k2]...`` if every level is a table, else ``{}``."""
-    current: Any = data or {}
-    for key in keys:
-        current = current.get(key) if isinstance(current, Mapping) else None
-    return dict(current) if isinstance(current, Mapping) else {}
-
-
-def _strings(value: object) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        return [item for item in value if isinstance(item, str)]
-    return []
-
-
-def _lines(value: str) -> list[str]:
-    """Non-empty, non-comment lines of a multi-line ini value."""
-    out = []
-    for raw in value.splitlines():
-        line = raw.split(" #", 1)[0].strip()
-        if line and not line.startswith("#"):
-            out.append(line)
-    return out
 
 
 def _requirement_name(text: str) -> str | None:
@@ -380,63 +360,6 @@ def _setup_cfg(scan: _Scan, facts: _Facts) -> None:
 
 
 # -- setup.py (ast only, never executed) --------------------------------------
-
-
-def _callee(node: ast.expr) -> str | None:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return node.attr
-    return None
-
-
-def _literal(node: ast.expr, names: Mapping[str, object]) -> object:
-    """Evaluate literals, names bound to literals and ``+`` of lists or strings.
-
-    Returns ``_UNKNOWN`` for anything else (calls, attributes, comprehensions):
-    those values only exist when setup.py runs, and it never runs here.
-    """
-    if isinstance(node, ast.Name):
-        return names.get(node.id, _UNKNOWN)
-    if isinstance(node, ast.List | ast.Tuple):
-        items = [_literal(item, names) for item in node.elts]
-        return _UNKNOWN if _UNKNOWN in items else items
-    if isinstance(node, ast.Dict):
-        if any(key is None for key in node.keys):
-            return _UNKNOWN  # {**other}
-        keys = [_literal(key, names) for key in node.keys if key is not None]
-        values = [_literal(value, names) for value in node.values]
-        if _UNKNOWN in keys or _UNKNOWN in values:
-            return _UNKNOWN
-        try:
-            return dict(zip(keys, values, strict=True))
-        except TypeError:
-            return _UNKNOWN  # unhashable key
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _literal(node.left, names), _literal(node.right, names)
-        if isinstance(left, list) and isinstance(right, list):
-            return left + right
-        if isinstance(left, str) and isinstance(right, str):
-            return left + right
-        return _UNKNOWN
-    try:
-        return ast.literal_eval(node)
-    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
-        return _UNKNOWN
-
-
-def _module_literals(module: ast.Module) -> dict[str, object]:
-    names: dict[str, object] = {}
-    for node in module.body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = node.targets[0]
-            if isinstance(target, ast.Name):
-                value = _literal(node.value, names)
-                if value is not _UNKNOWN:
-                    names[target.id] = value
-                else:
-                    names.pop(target.id, None)
-    return names
 
 
 def _setup_py(scan: _Scan, facts: _Facts) -> None:
