@@ -25,11 +25,40 @@ commit, then exports the result as a schema-validated task bundle.
   dates through the environment so they pass on machines without a global git
   config (CI included) and produce stable SHAs.
 - **Remote.** Creating the GitHub repository `vipul21435/reporewind` was not
-  permitted in the setup session, so the scaffold commits are local only. The
-  owner creates the remote; later agents must not try to work around that and
-  should keep committing locally until `origin` exists.
+  permitted in the setup session; the owner created it afterwards and it is
+  now `origin` (`main`). Push fast-forward only; never force-push.
 - **Planned runtime dependencies** (all light, no ML stack): typer, pydantic v2,
   pyyaml, httpx, packaging, defusedxml, fastapi, uvicorn.
+
+- **Slice 1 decisions (models, errors, git).**
+  - Git runs *hermetically*: `GIT_CONFIG_GLOBAL=/dev/null`,
+    `GIT_CONFIG_NOSYSTEM=1`, inherited `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_CONFIG_*`
+    scrubbed, `GIT_CEILING_DIRECTORIES` set to the parent of the target so a
+    non-repository work dir can never fall through to an enclosing repository,
+    `GIT_ALLOW_PROTOCOL=file:git:http:https:ssh`, `GIT_TERMINAL_PROMPT=0`,
+    `LC_ALL=C`. Trade-off: user `url.insteadOf` rewrites and credential
+    helpers are ignored; private repositories are out of scope.
+  - Diffs always use `--binary --full-index --src-prefix=a/ --dst-prefix=b/`
+    and an explicit rename mode, and are decoded with `surrogateescape`, so a
+    patch captured from any repository re-applies byte for byte.
+  - Work dirs are linked worktrees (`git worktree add --detach`), not clones:
+    one object store per repository, cheap checkouts, and they work from a
+    bare cache repository. `apply` refuses to run without a work tree because
+    in a bare repository `git apply` writes into the git dir.
+  - Revisions, remotes, refspecs and URLs starting with `-` are rejected
+    before git runs, and `--` / `--end-of-options` separate operands.
+  - `RepoRef` keeps identity only (host, owner, name). Where a stage needs to
+    clone from somewhere else (a local mirror, a test fixture), it takes an
+    explicit source location instead of stuffing a path into `RepoRef`.
+    `file://` and local paths are therefore not accepted by `RepoRef.parse`.
+  - `ResolvedFix` requires both a non-empty source patch and a non-empty test
+    patch, disjoint by path: a fix without test changes cannot prove a flip,
+    so the resolver (slice 2) must fail with `ResolveError` instead of
+    producing one.
+  - The fixture builder lives in `reporewind.testing` (no pytest import, like
+    `typer.testing`) so it is strictly typed and reusable; `tests/conftest.py`
+    exposes it as `repo_factory`. Its initial commit SHA is pinned in a test
+    to catch any machine-dependent drift.
 
 ## Target layout
 
@@ -56,23 +85,23 @@ demo/                recorded end-to-end runs on public repos
 Each slice is a coherent feature delivered as 3-4 real commits, each with
 tests, green lint (ruff), strict typecheck (mypy) and a green suite.
 
-1. **Domain models, errors and git plumbing** - Add pydantic v2 domain models (`RepoRef` parsed from HTTPS/SSH/`owner/repo` forms, `CommitInfo`, `FilePatch`, `ResolvedFix`), a typed error hierarchy, and a no-shell `Git` wrapper (clone, fetch a single SHA, rev-parse, parents, commit date, diff, apply --check, apply, detached checkout into a work dir). Ship a pytest `repo_factory` fixture that builds throwaway git repos in tmp dirs with fixed author/committer dates, so every later slice tests offline.
+1. [x] **Domain models, errors and git plumbing** (done 2026-09-29) - Add pydantic v2 domain models (`RepoRef` parsed from HTTPS/SSH/`owner/repo` forms, `CommitInfo`, `FilePatch`, `ResolvedFix`), a typed error hierarchy, and a no-shell `Git` wrapper (clone, fetch a single SHA, rev-parse, parents, commit date, diff, apply --check, apply, detached checkout into a work dir). Ship a pytest `repo_factory` fixture that builds throwaway git repos in tmp dirs with fixed author/committer dates, so every later slice tests offline.
 
-2. **Commit resolver and diff splitter** - From a repo URL plus fix SHA, resolve the parent commit (reject root commits; require an explicit mainline for merge commits), compute the fix diff and split it per file into a source patch and a test patch using configurable path rules (`tests/`, `test_*.py`, `*_test.py`, `conftest.py`), handling adds, deletes, renames and binary files, and prove both patches apply cleanly to the parent. Resolve a GitHub PR number to its fix/base commits through the REST API (httpx with an injectable transport, recorded JSON fixtures, optional `GITHUB_TOKEN`). Expose `reporewind resolve` that prints or writes the `ResolvedFix` JSON.
+2. [ ] **Commit resolver and diff splitter** - From a repo URL plus fix SHA, resolve the parent commit (reject root commits; require an explicit mainline for merge commits), compute the fix diff and split it per file into a source patch and a test patch using configurable path rules (`tests/`, `test_*.py`, `*_test.py`, `conftest.py`), handling adds, deletes, renames and binary files, and prove both patches apply cleanly to the parent. Resolve a GitHub PR number to its fix/base commits through the REST API (httpx with an injectable transport, recorded JSON fixtures, optional `GITHUB_TOKEN`). Expose `reporewind resolve` that prints or writes the `ResolvedFix` JSON.
 
-3. **Build recipes: schema, detection and store** - Define a pydantic `Recipe` (Python constraint, install mode, extras, requirements files, system packages, pre-install steps, test command, test framework, env) and detectors that read `pyproject.toml` (PEP 621, setuptools, poetry, hatch, flit), `setup.py` (parsed with `ast`, never executed), `setup.cfg`, `requirements*.txt` and `tox.ini` at the parent commit via `git show`. Store recipes as `recipes/<owner>__<repo>.yaml` where human overrides deep-merge over detected values and the result is validated; add a stable recipe hash (sha256 of canonical JSON) and `reporewind recipe detect|show|validate`.
+3. [ ] **Build recipes: schema, detection and store** - Define a pydantic `Recipe` (Python constraint, install mode, extras, requirements files, system packages, pre-install steps, test command, test framework, env) and detectors that read `pyproject.toml` (PEP 621, setuptools, poetry, hatch, flit), `setup.py` (parsed with `ast`, never executed), `setup.cfg`, `requirements*.txt` and `tox.ini` at the parent commit via `git show`. Store recipes as `recipes/<owner>__<repo>.yaml` where human overrides deep-merge over detected values and the result is validated; add a stable recipe hash (sha256 of canonical JSON) and `reporewind recipe detect|show|validate`.
 
-4. **Historical pinning: Python version, dependencies, base image** - Infer the Python version from `requires-python`, trove classifiers and a commit-date table of CPython release dates (newest release that existed at the commit and satisfies the constraints). Resolve dependencies as of the commit date with `uv pip compile --exclude-newer <commit-date> --python-version X.Y` behind a `CommandRunner` protocol (fake in unit tests). Resolve `python:X.Y-slim` to an immutable `@sha256:` digest via `docker buildx imagetools inspect`, with an offline fallback table and `REPOREWIND_OFFLINE`. Expose `reporewind pin`, which writes the lock file and a `PinResult`.
+4. [ ] **Historical pinning: Python version, dependencies, base image** - Infer the Python version from `requires-python`, trove classifiers and a commit-date table of CPython release dates (newest release that existed at the commit and satisfies the constraints). Resolve dependencies as of the commit date with `uv pip compile --exclude-newer <commit-date> --python-version X.Y` behind a `CommandRunner` protocol (fake in unit tests). Resolve `python:X.Y-slim` to an immutable `@sha256:` digest via `docker buildx imagetools inspect`, with an offline fallback table and `REPOREWIND_OFFLINE`. Expose `reporewind pin`, which writes the lock file and a `PinResult`.
 
-5. **Dockerfile generation, build cache and build lock** - Render a deterministic Dockerfile (base image by digest, non-root user, locked requirements installed with uv, repository checked out at the parent SHA, no network needed at test time) with golden-file tests. Tag images by a content hash of recipe + lock + base digest, keep a JSON build-cache index so an identical environment is never rebuilt, and guard builds with a cross-process file lock (timeout, stale-lock recovery) proven by a multiprocessing test in which N concurrent builders produce exactly one build. Expose `reporewind build` with `--dry-run`.
+5. [ ] **Dockerfile generation, build cache and build lock** - Render a deterministic Dockerfile (base image by digest, non-root user, locked requirements installed with uv, repository checked out at the parent SHA, no network needed at test time) with golden-file tests. Tag images by a content hash of recipe + lock + base digest, keep a JSON build-cache index so an identical environment is never rebuilt, and guard builds with a cross-process file lock (timeout, stale-lock recovery) proven by a multiprocessing test in which N concurrent builders produce exactly one build. Expose `reporewind build` with `--dry-run`.
 
-6. **Test runner, JUnit parsing and fail-to-pass verification** - Parse JUnit XML safely (defusedxml; pytest and unittest variants, failure vs error vs skip, parametrized ids, nested testsuites) into per-test outcomes. Add an `Executor` protocol with a local subprocess executor (used by integration tests on throwaway repos) and a Docker executor. Implement the flip protocol: parent + test patch must fail the selected tests, parent + fix + test patch must pass them; compute FAIL_TO_PASS and PASS_TO_PASS and a `Verdict` (valid, no-flip, broken-baseline, regression). Detect flaky tests by re-running N times and excluding inconsistent ones with a report. Expose `reporewind verify`.
+6. [ ] **Test runner, JUnit parsing and fail-to-pass verification** - Parse JUnit XML safely (defusedxml; pytest and unittest variants, failure vs error vs skip, parametrized ids, nested testsuites) into per-test outcomes. Add an `Executor` protocol with a local subprocess executor (used by integration tests on throwaway repos) and a Docker executor. Implement the flip protocol: parent + test patch must fail the selected tests, parent + fix + test patch must pass them; compute FAIL_TO_PASS and PASS_TO_PASS and a `Verdict` (valid, no-flip, broken-baseline, regression). Detect flaky tests by re-running N times and excluding inconsistent ones with a report. Expose `reporewind verify`.
 
-7. **Task bundle export, full CLI and FastAPI service** - Write task bundles (`task.json` validated by a pydantic model whose JSON Schema is exported to `schemas/`, `Dockerfile`, `fix.patch`, `test.patch`, `fail_to_pass.txt`, `pass_to_pass.txt`, the dependency lock, and a sha256 manifest) and a `reporewind validate-bundle` command that re-checks schema and hashes. Wire the end-to-end `reporewind run` (resolve, recipe, pin, build, verify, export) with consistent exit codes, and add a small FastAPI service (`GET /healthz`, `POST /resolve`, `POST /jobs`, `GET /jobs/{id}`) backed by a background job queue, tested with `TestClient`.
+7. [ ] **Task bundle export, full CLI and FastAPI service** - Write task bundles (`task.json` validated by a pydantic model whose JSON Schema is exported to `schemas/`, `Dockerfile`, `fix.patch`, `test.patch`, `fail_to_pass.txt`, `pass_to_pass.txt`, the dependency lock, and a sha256 manifest) and a `reporewind validate-bundle` command that re-checks schema and hashes. Wire the end-to-end `reporewind run` (resolve, recipe, pin, build, verify, export) with consistent exit codes, and add a small FastAPI service (`GET /healthz`, `POST /resolve`, `POST /jobs`, `GET /jobs/{id}`) backed by a background job queue, tested with `TestClient`.
 
-8. **Docker, compose and end-to-end demo** - Add a slim multi-stage Dockerfile for the RepoRewind CLI/API (non-root, labeled `project=reporewind`), a `docker-compose.yml` for the API with a cache volume and opt-in Docker socket, `e2e`-marked tests that exercise the real network and Docker path, and a separate manually triggered CI job for them. Make `make demo` run the full pipeline on 1-2 small, permissively licensed public Python repos at real fix commits, and commit the produced bundles and verification logs under `demo/` with the exact commands used.
+8. [ ] **Docker, compose and end-to-end demo** - Add a slim multi-stage Dockerfile for the RepoRewind CLI/API (non-root, labeled `project=reporewind`), a `docker-compose.yml` for the API with a cache volume and opt-in Docker socket, `e2e`-marked tests that exercise the real network and Docker path, and a separate manually triggered CI job for them. Make `make demo` run the full pipeline on 1-2 small, permissively licensed public Python repos at real fix commits, and commit the produced bundles and verification logs under `demo/` with the exact commands used.
 
-9. **Benchmarks and docs polish** - Add a benchmark script under `bench/` that measures diff-split and JUnit-parse throughput, cold vs warm (cache-hit) environment build time and end-to-end verify time on the demo repos, and put its output in the README with the command to reproduce it. Write `docs/` pages for the architecture (ASCII diagram), recipe format and bundle schema; finish the README with real coverage and test counts from `make cov`, limitations and a roadmap; add a CHANGELOG.
+9. [ ] **Benchmarks and docs polish** - Add a benchmark script under `bench/` that measures diff-split and JUnit-parse throughput, cold vs warm (cache-hit) environment build time and end-to-end verify time on the demo repos, and put its output in the README with the command to reproduce it. Write `docs/` pages for the architecture (ASCII diagram), recipe format and bundle schema; finish the README with real coverage and test counts from `make cov`, limitations and a roadmap; add a CHANGELOG.
 
 ## Definition of done (every slice)
 
