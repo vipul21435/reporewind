@@ -4,24 +4,26 @@
 ![python](https://img.shields.io/badge/python-3.12-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
-Rebuild an open-source Python repository at any historical commit inside a
-digest-pinned Docker image, then prove that a fix commit flips its tests from
-failing to passing.
+Rebuild an open-source Python repository at a historical commit inside a
+Docker image on a digest-pinned base, with the goal of proving that a fix
+commit flips its tests from failing to passing.
 
-> **Status.** The first four pipeline stages are complete. **Resolve**: a
-> fix commit or a merged GitHub pull request becomes a base commit plus a
+> **Status.** The first four pipeline stages are implemented. **Resolve**:
+> a fix commit or a merged GitHub pull request becomes a base commit plus a
 > source patch and a test patch, with a proof that the split is exact.
 > **Recipe**: the base commit's packaging metadata becomes a validated build
 > recipe, stored as YAML with human overrides and a stable hash. **Pin**:
 > the base commit gets the Python version it was built with, a dependency
 > lock as of its commit date and a `python:X.Y-slim` base image pinned by
-> digest. **Build**: the pin becomes a deterministic, digest-pinned,
-> non-root Dockerfile whose image is tagged by a content hash and built at
-> most once, behind a JSON cache index and a cross-process build lock (live
-> image builds have not been measured yet). They ship with a hermetic git
-> layer, an offline demo and a digest-pinned CLI image. Automated
-> fail-to-pass verification and bundle export are **not built yet**; they are listed
-> under [Roadmap](#roadmap) and tracked in [PLAN.md](PLAN.md).
+> digest. **Build**: the pin becomes a deterministic, non-root Dockerfile
+> on digest-pinned base images, tagged by a content hash and built at most
+> once, behind a JSON cache index and a cross-process build lock. Live image
+> builds have not been measured yet, and most pre-2022 setuptools commits
+> cannot be built yet (see [Known issues](#known-issues)). They ship with a
+> hermetic git layer, an offline demo and a digest-pinned CLI image.
+> Automated fail-to-pass verification and bundle export are **not built
+> yet**; they are listed under [Roadmap](#roadmap) and tracked in
+> [PLAN.md](PLAN.md).
 
 ## Why this exists
 
@@ -653,8 +655,8 @@ produced each number is next to it.
 
 | What | Result | Command |
 |---|---|---|
-| Offline test suite | 512 passed, 6 deselected (e2e) | `make cov` |
-| Branch-inclusive coverage | 98.81% (gate: 85%) | `make cov` |
+| Offline test suite | 528 passed, 6 deselected (e2e) | `make cov` |
+| Branch-inclusive coverage | 98.71% (gate: 85%) | `make cov` |
 | Concurrent builders for one environment -> builds | 6 processes -> 1 build, 5 cache hits (1.45 s) | `uv run pytest -q tests/test_build_cache.py -k concurrent` |
 | Network end-to-end tests (live GitHub API, git remotes, recipe re-detection, real `uv pip compile`, registry digest lookup) | 6 passed | `make e2e` |
 | Packages locked for markupsafe#477 / attrs#1606 bases | 4 / 12 | `reporewind pin ...` (see [Historical pinning](#historical-pinning)) |
@@ -662,7 +664,7 @@ produced each number is next to it.
 | Cache size after resolving attrs#1606 vs a full bare clone | 1.0M vs 6.2M | `du -sh` on `$REPOREWIND_HOME/repos/github.com/*` and on `git clone --bare` |
 | Same for markupsafe#477 | 396K vs 1.2M | as above |
 | Image layers added on top of `python:3.12-slim` | git 109MB, venv 30MB | `docker history reporewind:local` |
-| Source / test code size | 6264 / 5417 lines | `cat src/reporewind/*.py src/reporewind/*/*.py \| wc -l` and `cat tests/*.py \| wc -l` |
+| Source / test code size | 6430 / 5603 lines | `cat src/reporewind/*.py src/reporewind/*/*.py \| wc -l` and `cat tests/*.py \| wc -l` |
 
 CI (GitHub Actions) runs ruff, ruff format, `mypy --strict` and the coverage
 suite on every push and pull request, and a second job builds the image and
@@ -717,11 +719,55 @@ runs the demo inside it.
 - **Stable exit codes per error category**, so scripts and CI can tell bad
   input from a git failure from a commit that cannot prove a flip.
 
+## Known issues
+
+Confirmed by review on 2026-09-29 and **not fixed yet**. Each one limits
+what the build stage above can do today:
+
+1. **Most historical setuptools commits cannot be installed.** The project
+   is installed with `uv pip install --exclude-newer <cutoff> --no-deps
+   [-e] .` in an isolated build, so the cutoff also applies to the build
+   backend. Editable installs need PEP 660 `build_editable` (setuptools
+   64.0, August 2022), and a `setup.py`-only project falls back to
+   `setuptools>=40.8.0` (February 2019), so older commits fail the image
+   build. The golden file `tests/golden/editable_pytest.Dockerfile` is one
+   such command. The scripted-docker tests do not catch it.
+2. **`SETUPTOOLS_SCM_PRETEND_VERSION` is image-wide.** It is set before the
+   locked-requirements install, so a locked dependency that uv builds from
+   an sdist with setuptools-scm or hatch-vcs gets version `0.0.0+reporewind`
+   and uv rejects it. It should apply only to the project install.
+3. **The pinned platform is not passed to docker.** Locks are compiled for
+   `x86_64-unknown-linux-gnu`, but `docker build` runs without
+   `--platform linux/amd64` and the environment key does not include the
+   platform, so an arm64 host builds an arm64 image from an x86_64 lock.
+4. **`git archive` honours `.gitattributes`.** Paths marked `export-ignore`
+   (for example `tests/`) are silently missing from the build context, and
+   `export-subst` rewrites files from the local clone's refs.
+5. **Symlinks to absolute or outside paths crash `build`.** The tar export
+   uses `extractall(filter="data")`, which raises for such links; the error
+   is not categorized, so `build` exits 1 with a traceback instead of 13.
+6. **Recipe `env` values are not escaped for Dockerfile `ENV`.** Values are
+   written with `json.dumps`, so `$VAR` is expanded by docker and `\n` or
+   `\uXXXX` escapes stay literal.
+7. **Factor-only tox requirements files are dropped.** When every test env
+   names its requirements file under a factor
+   (`py{38,39}: -rrequirements/test.txt`), no requirements file is
+   installed, only the default `pytest`.
+8. **A redundant `test_framework` override discards the detected command.**
+   Restating the detected framework (for example `test_framework:
+   unittest`) replaces `discover -s tests -t .` with a bare `discover -v`.
+9. **The Dockerfile frontend is a floating tag.** Every rendered Dockerfile
+   starts with `# syntax=docker/dockerfile:1`, which BuildKit resolves from
+   Docker Hub at build time; it is not digest-pinned and not part of the
+   environment key.
+
 ## Roadmap
 
 Planned, **not built yet** (details and acceptance criteria in
 [PLAN.md](PLAN.md)):
 
+0. **Fix the [known issues](#known-issues)** above, each with a
+   regression test, and measure a live image build.
 1. **Automated verification** - JUnit XML parsing, local and Docker
    executors, the fail-to-pass protocol with FAIL_TO_PASS / PASS_TO_PASS
    lists and a verdict, and flaky-test detection by re-runs.
