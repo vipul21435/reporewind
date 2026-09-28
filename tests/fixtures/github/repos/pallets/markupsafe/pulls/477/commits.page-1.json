@@ -1,0 +1,30 @@
+[
+  {
+    "commit": {
+      "author": {
+        "date": "2024-10-16T21:10:17Z"
+      },
+      "message": "start version 3.1.0"
+    },
+    "parents": [
+      {
+        "sha": "9c44ecf45141f691d373a66ce664c43b5a6cc761"
+      }
+    ],
+    "sha": "4dafb7c36f1f654f1edd85228d346252b0065d45"
+  },
+  {
+    "commit": {
+      "author": {
+        "date": "2024-10-17T00:07:09Z"
+      },
+      "message": "relax speedups str check"
+    },
+    "parents": [
+      {
+        "sha": "4dafb7c36f1f654f1edd85228d346252b0065d45"
+      }
+    ],
+    "sha": "8cb1691ca038ca39942e088b956f5b94d8f636bf"
+  }
+]

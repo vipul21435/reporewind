@@ -19,6 +19,8 @@ from reporewind.errors import ConfigError, RepoRewindError
 from reporewind.gitops import Git
 from reporewind.models import RepoRef
 from reporewind.resolve import (
+    GitHubClient,
+    PullRequestFix,
     RepoCache,
     Resolution,
     SplitRules,
@@ -60,6 +62,11 @@ def main(
 def version_cmd() -> None:
     """Print the installed RepoRewind version."""
     typer.echo(__version__)
+
+
+def github_client(repo: RepoRef) -> GitHubClient:
+    """The GitHub client used by ``resolve --pr`` (replaced in tests)."""
+    return GitHubClient.for_repo(repo)
 
 
 @contextmanager
@@ -119,9 +126,17 @@ def _summary(resolution: Resolution) -> str:
 def resolve_cmd(
     repo: Annotated[str, typer.Argument(help="Repository: owner/repo or a clone URL.")],
     fix: Annotated[
-        str,
+        str | None,
         typer.Argument(help="Fix commit: a full SHA, or any revision with --repo-dir."),
-    ],
+    ] = None,
+    pr: Annotated[
+        int | None,
+        typer.Option(
+            "--pr",
+            min=1,
+            help="Resolve a merged GitHub pull request instead of a SHA ($GITHUB_TOKEN optional).",
+        ),
+    ] = None,
     mainline: Annotated[
         int | None,
         typer.Option(
@@ -175,6 +190,17 @@ def resolve_cmd(
     with _exit_on_error():
         ref = RepoRef.parse(repo)
         rules = _split_rules(test_dir, test_file, include, exclude)
+        pull: PullRequestFix | None = None
+        if fix is not None and pr is not None:
+            raise ConfigError("give either a fix commit or --pr NUMBER, not both")
+        if pr is not None:
+            if mainline is not None:
+                raise ConfigError("--mainline is chosen from the pull request; drop it with --pr")
+            with github_client(ref) as client:
+                pull = client.resolve_pull_request(ref, pr)
+            fix, mainline = pull.fix_sha, pull.mainline
+        if fix is None:
+            raise ConfigError("give a fix commit or --pr NUMBER")
         if repo_dir is not None:
             git = Git(repo_dir)
             if not git.is_repo():
@@ -182,7 +208,7 @@ def resolve_cmd(
         else:
             cache = RepoCache(cache_dir if cache_dir is not None else home_dir())
             git = cache.ensure_commit(ref, fix, source=source)
-        resolution = resolve_fix(git, ref, fix, mainline=mainline, rules=rules)
+        resolution = resolve_fix(git, ref, fix, mainline=mainline, rules=rules, pr_number=pr)
         text = dump_resolved_fix(resolution.fix)
         if output is None:
             typer.echo(text, nl=False)
@@ -190,6 +216,12 @@ def resolve_cmd(
             output.parent.mkdir(parents=True, exist_ok=True)
             output.write_text(text, encoding="ascii")
         if not quiet:
+            if pull is not None:
+                typer.echo(
+                    f"pull request #{pull.number} ({pull.title}) landed as a {pull.shape.value}"
+                    f" {pull.fix_sha[:12]}",
+                    err=True,
+                )
             typer.echo(_summary(resolution), err=True)
             if output is not None:
                 typer.echo(f"  wrote   {output}", err=True)

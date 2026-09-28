@@ -1,0 +1,14 @@
+{
+  "commit": {
+    "author": {
+      "date": "2026-08-02T11:46:58Z"
+    },
+    "message": "Stop evolve dunders from being modified (#1606)\n\n* Stop evolve dunders from being modified\n\n* Better name, test both ways"
+  },
+  "parents": [
+    {
+      "sha": "f38b8a3f1625060aa4245930822c34c11c252f83"
+    }
+  ],
+  "sha": "f53fc5440d7f86aac4328aec7a563eb48634177f"
+}

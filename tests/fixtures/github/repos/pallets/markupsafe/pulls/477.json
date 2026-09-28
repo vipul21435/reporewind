@@ -1,0 +1,17 @@
+{
+  "base": {
+    "ref": "3.0.x",
+    "sha": "9c44ecf45141f691d373a66ce664c43b5a6cc761"
+  },
+  "commits": 2,
+  "head": {
+    "ref": "str-exact",
+    "sha": "8cb1691ca038ca39942e088b956f5b94d8f636bf"
+  },
+  "merge_commit_sha": "e85aff4d878aa458d5c1e879bf475d8483647f71",
+  "merged": true,
+  "merged_at": "2024-10-17T00:18:01Z",
+  "number": 477,
+  "state": "closed",
+  "title": "relax speedups str check"
+}

@@ -17,6 +17,7 @@ codes without string matching and callers can catch a whole stage at once::
     |       +-- PatchApplyError        patch does not apply to the work tree
     +-- ResolveError               10  commit resolution / diff splitting
     |   +-- PatchParseError            a diff that cannot be split into file patches
+    |   +-- GitHubAPIError             a GitHub REST API request failed
     +-- RecipeError                11  build recipe detection or validation
     +-- PinError                   12  Python / dependency / base image pinning
     +-- BuildError                 13  Docker image build
@@ -147,6 +148,14 @@ class ResolveError(RepoRewindError):
 
 class PatchParseError(ResolveError):
     """A diff could not be split into per-file patches (malformed or not re-applicable)."""
+
+
+class GitHubAPIError(ResolveError):
+    """A GitHub REST API request failed; ``status`` is the HTTP status, if any."""
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        self.status = status
+        super().__init__(message)
 
 
 class RecipeError(RepoRewindError):

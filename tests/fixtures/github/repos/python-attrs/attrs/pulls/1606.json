@@ -1,0 +1,17 @@
+{
+  "base": {
+    "ref": "main",
+    "sha": "f38b8a3f1625060aa4245930822c34c11c252f83"
+  },
+  "commits": 2,
+  "head": {
+    "ref": "evolve",
+    "sha": "0bc217f8f4cdf0477da96b5ffec4a137d1e3489a"
+  },
+  "merge_commit_sha": "f53fc5440d7f86aac4328aec7a563eb48634177f",
+  "merged": true,
+  "merged_at": "2026-08-02T11:46:58Z",
+  "number": 1606,
+  "state": "closed",
+  "title": "Stop evolve dunders from being modified"
+}

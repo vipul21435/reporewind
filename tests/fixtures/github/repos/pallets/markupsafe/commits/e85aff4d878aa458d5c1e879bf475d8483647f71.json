@@ -1,0 +1,17 @@
+{
+  "commit": {
+    "author": {
+      "date": "2024-10-17T00:18:01Z"
+    },
+    "message": "relax speedups str check (#477)"
+  },
+  "parents": [
+    {
+      "sha": "9c44ecf45141f691d373a66ce664c43b5a6cc761"
+    },
+    {
+      "sha": "8cb1691ca038ca39942e088b956f5b94d8f636bf"
+    }
+  ],
+  "sha": "e85aff4d878aa458d5c1e879bf475d8483647f71"
+}
