@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -20,8 +21,21 @@ from reporewind import __version__
 from reporewind.errors import ConfigError, RecipeError, RepoRewindError
 from reporewind.gitops import Git
 from reporewind.models import RepoRef
+from reporewind.pinning import (
+    DEFAULT_PLATFORM,
+    PinOptions,
+    PinResult,
+    dump_pin_result,
+    format_timestamp,
+    is_offline,
+    pin_commit,
+    write_pin,
+)
+from reporewind.proc import CommandRunner, SubprocessRunner
 from reporewind.recipes import (
     DEFAULT_RECIPES_DIR,
+    GitTreeSource,
+    Recipe,
     RecipeFile,
     RecipeStore,
     detect_at,
@@ -78,6 +92,11 @@ def version_cmd() -> None:
 def github_client(repo: RepoRef) -> GitHubClient:
     """The GitHub client used by ``resolve --pr`` (replaced in tests)."""
     return GitHubClient.for_repo(repo)
+
+
+def command_runner() -> CommandRunner:
+    """The runner ``pin`` uses for uv and docker (replaced in tests)."""
+    return SubprocessRunner()
 
 
 @contextmanager
@@ -391,3 +410,155 @@ def recipe_validate_cmd(
             typer.echo(f"ok       {path}  {recipe_file.recipe_hash()}")
         if failures:
             raise RecipeError(f"{_plural(failures, 'recipe file')} failed validation")
+
+
+def _parse_cutoff(value: str) -> datetime:
+    """An ISO 8601 date or date-time; a value without a timezone is taken as UTC."""
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        message = f"--exclude-newer {value!r} is not an ISO 8601 date or date-time"
+        raise ConfigError(message) from None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _pin_recipe(
+    store: RecipeStore, ref: RepoRef, git: Git, target: str
+) -> tuple[Recipe, tuple[str, ...]]:
+    """The stored recipe for ``ref``, or one detected at ``target`` if there is no file."""
+    if store.path_for(ref).is_file():
+        recipe_file = store.load(ref)
+        detected_at = recipe_file.detected.commit
+        notes: tuple[str, ...] = ()
+        if detected_at is not None and detected_at != target:
+            notes = (f"the recipe was detected at {detected_at[:12]}, not at {target[:12]}",)
+        return recipe_file.recipe(), notes
+    detection = detect_at(git, target)
+    note = (
+        f"no recipe file at {store.path_for(ref)}; used the recipe detected at {target[:12]}"
+        " (run `reporewind recipe detect` to review and store it)"
+    )
+    return detection.recipe(), (note,)
+
+
+def _pin_summary(result: PinResult, where: str, lock_path: Path, pin_path: Path) -> str:
+    python, image = result.python, result.base_image
+    lines = [
+        f"pinned {result.repo} at {where}, committed {format_timestamp(result.commit_date)}",
+        f"  python   {python.version} ({python.reason})",
+        f"  image    {image.reference} ({image.source})",
+        f"  lock     {_plural(len(result.packages), 'package')} published up to"
+        f" {format_timestamp(result.exclude_newer)}, {result.platform}",
+        f"  recipe   {result.recipe_hash}",
+    ]
+    lines += [f"  note     {note}" for note in result.notes]
+    lines += [f"  wrote    {lock_path}", f"  wrote    {pin_path}"]
+    return "\n".join(lines)
+
+
+@app.command("pin")
+def pin_cmd(
+    repo: Annotated[str, typer.Argument(help="Repository: owner/repo or a clone URL.")],
+    rev: Annotated[
+        str,
+        typer.Argument(help="Fix commit; its parent is pinned, the commit that gets built."),
+    ],
+    at_rev: Annotated[
+        bool, typer.Option("--at-rev", help="Pin REV itself, not its parent.")
+    ] = False,
+    mainline: Annotated[
+        int | None,
+        typer.Option("--mainline", "-m", min=1, help="For a merge commit, the parent to pin."),
+    ] = None,
+    repo_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--repo-dir",
+            file_okay=False,
+            help="Read commits from this existing local clone instead of the cache.",
+        ),
+    ] = None,
+    source: Annotated[
+        str | None,
+        typer.Option(help="Fetch from this URL or path instead of the repository's clone URL."),
+    ] = None,
+    cache_dir: Annotated[
+        Path | None,
+        typer.Option(help="State directory for cached repos and pins [default: $REPOREWIND_HOME]."),
+    ] = None,
+    recipes_dir: RecipesDirOption = DEFAULT_RECIPES_DIR,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            "-o",
+            file_okay=False,
+            help="Where to write requirements.lock and pin.json"
+            " [default: $REPOREWIND_HOME/pins/<host>/<owner>__<repo>/<sha>].",
+        ),
+    ] = None,
+    python: Annotated[
+        str | None,
+        typer.Option("--python", help="Use this Python version (X.Y) instead of inferring it."),
+    ] = None,
+    exclude_newer: Annotated[
+        str | None,
+        typer.Option(
+            "--exclude-newer",
+            help="Lock packages published up to this ISO 8601 date [default: the commit date].",
+        ),
+    ] = None,
+    platform: Annotated[
+        str, typer.Option(help="Target platform passed to uv --python-platform.")
+    ] = DEFAULT_PLATFORM,
+    hashes: Annotated[
+        bool, typer.Option("--hashes/--no-hashes", help="Record sha256 hashes in the lock.")
+    ] = True,
+    offline: Annotated[
+        bool,
+        typer.Option(
+            "--offline",
+            help="Use recorded image digests and uv --offline (also $REPOREWIND_OFFLINE=1).",
+        ),
+    ] = False,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", "-q", help="Do not print the summary on stderr.")
+    ] = False,
+) -> None:
+    """Pin the Python version, dependencies and base image of the commit that gets built."""
+    with _exit_on_error():
+        ref = RepoRef.parse(repo)
+        if at_rev and mainline is not None:
+            raise ConfigError("--mainline picks a parent; it cannot be used with --at-rev")
+        options = PinOptions(
+            python=python,
+            exclude_newer=_parse_cutoff(exclude_newer) if exclude_newer is not None else None,
+            platform=platform,
+            generate_hashes=hashes,
+            offline=offline or is_offline(),
+        )
+        git = _open_repository(ref, rev, repo_dir=repo_dir, source=source, cache_dir=cache_dir)
+        commit = git.commit_info(rev)
+        target = commit.sha if at_rev else select_base(commit, mainline)
+        recipe, notes = _pin_recipe(RecipeStore(recipes_dir), ref, git, target)
+        result, lock_text = pin_commit(
+            GitTreeSource(git, target),
+            ref,
+            git.commit_info(target),
+            recipe,
+            command_runner(),
+            options,
+            notes=notes,
+        )
+        if output_dir is None:
+            root = cache_dir if cache_dir is not None else home_dir()
+            output_dir = root / "pins" / ref.host / ref.recipe_stem / target
+        lock_path, pin_path = write_pin(result, lock_text, output_dir)
+        typer.echo(dump_pin_result(result), nl=False)
+        if quiet:
+            return
+        where = target[:12]
+        if not at_rev:
+            number = commit.parents.index(target) + 1
+            where += f" (parent {number} of {len(commit.parents)} of {commit.sha[:12]})"
+        typer.echo(_pin_summary(result, where, lock_path, pin_path), err=True)
