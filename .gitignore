@@ -1,0 +1,33 @@
+# Python bytecode and build output
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Secrets: only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# RepoRewind runtime state (clones, build cache index, locks, work dirs)
+.reporewind/
+work/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
