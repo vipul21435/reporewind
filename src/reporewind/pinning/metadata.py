@@ -20,6 +20,7 @@ import tomllib
 from collections.abc import Iterable, Mapping
 from typing import Any
 
+from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.utils import canonicalize_name
 from pydantic import BaseModel, ConfigDict, Field
@@ -35,6 +36,7 @@ class ProjectMetadata(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    name: str | None = None
     classifiers: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     extras: dict[str, tuple[str, ...]] = Field(default_factory=dict)
@@ -42,17 +44,63 @@ class ProjectMetadata(BaseModel):
     notes: tuple[str, ...] = ()
 
     def requirements(self, extras: Iterable[str] = ()) -> tuple[str, ...]:
-        """Runtime requirements plus those of the given (normalized) extras, deduplicated."""
+        """Runtime requirements plus those of the given extras, deduplicated.
+
+        References to the project itself (``tests = ["attrs[tests-no-zope]"]``)
+        are expanded into the named extras of this commit, never resolved from
+        the package index: that would lock an older published release of the
+        project and take the nested extras from its metadata instead.
+        """
         out = list(self.dependencies)
         for extra in extras:
             out += self.extras.get(canonicalize_name(extra), ())
+        return self.expand(out)
+
+    def expand(self, requirements: Iterable[str]) -> tuple[str, ...]:
+        """``requirements`` with references to this project replaced by its extras."""
+        out: list[str] = []
+        self._expand(requirements, None, set(), out)
         return tuple(dict.fromkeys(out))
+
+    def _expand(
+        self, requirements: Iterable[str], marker: str | None, seen: set[str], out: list[str]
+    ) -> None:
+        own = canonicalize_name(self.name) if self.name else None
+        for text in requirements:
+            try:
+                requirement = Requirement(text)
+            except InvalidRequirement:
+                out.append(text)
+                continue
+            if own is None or canonicalize_name(requirement.name) != own:
+                out.append(_with_marker(requirement, marker))
+                continue
+            inner = _and(marker, str(requirement.marker) if requirement.marker else None)
+            for extra in sorted(canonicalize_name(name) for name in requirement.extras):
+                if extra in seen:
+                    continue
+                self._expand(self.extras.get(extra, ()), inner, seen | {extra}, out)
+
+
+def _and(left: str | None, right: str | None) -> str | None:
+    if left and right:
+        return f"({left}) and ({right})"
+    return left or right
+
+
+def _with_marker(requirement: Requirement, marker: str | None) -> str:
+    if marker is None:
+        return str(requirement)
+    combined = _and(marker, str(requirement.marker) if requirement.marker else None)
+    requirement.marker = Marker(combined or marker)
+    return str(requirement)
 
 
 class _Reader:
     def __init__(self, tree: TreeSource) -> None:
         self.tree = tree
         self.index = frozenset(tree.files())
+        self.name: str | None = None
         self.classifiers: list[str] = []
         self.dependencies: list[str] = []
         self.extras: dict[str, list[str]] = {}
@@ -90,6 +138,10 @@ class _Reader:
             bucket = self.extras.setdefault(canonicalize_name(name), [])
             self.add_requirements(bucket, strings(values), f"{origin} {name}")
 
+    def add_name(self, value: object) -> None:
+        if self.name is None and isinstance(value, str) and value.strip():
+            self.name = value.strip()
+
     def add_classifiers(self, values: object) -> None:
         if not self.classifiers:
             self.classifiers = [value.strip() for value in strings(values) if value.strip()]
@@ -106,6 +158,7 @@ def _pyproject(reader: _Reader) -> None:
         return
     project = toml_table(data, "project")
     dynamic = set(strings(project.get("dynamic")))
+    reader.add_name(project.get("name"))
     reader.add_classifiers(project.get("classifiers"))
     if "dependencies" in dynamic:
         reader.note("pyproject.toml: dependencies are dynamic (computed at build time)")
@@ -119,9 +172,11 @@ def _pyproject(reader: _Reader) -> None:
     poetry = toml_table(data, "tool", "poetry")
     if not poetry:
         return
+    reader.add_name(poetry.get("name"))
     reader.add_classifiers(poetry.get("classifiers"))
     for name, spec in toml_table(poetry, "dependencies").items():
-        if canonicalize_name(name) == "python":
+        if canonicalize_name(name) == "python" or _optional(spec):
+            # Optional dependencies are installed only through an extra.
             continue
         try:
             requirement = poetry_requirement(name, spec)
@@ -146,6 +201,14 @@ def _pyproject(reader: _Reader) -> None:
         reader.add_extras({name: resolved}, "pyproject.toml poetry extra")
 
 
+def _optional(spec: object) -> bool:
+    if isinstance(spec, Mapping):
+        return spec.get("optional") is True
+    if isinstance(spec, list) and spec:
+        return all(isinstance(item, Mapping) and item.get("optional") is True for item in spec)
+    return False
+
+
 def _setup_cfg(reader: _Reader) -> None:
     text = reader.text("setup.cfg")
     if text is None:
@@ -156,6 +219,7 @@ def _setup_cfg(reader: _Reader) -> None:
     except configparser.Error:
         reader.note("setup.cfg could not be parsed; it was skipped")
         return
+    reader.add_name(parser.get("metadata", "name", fallback=None))
     reader.add_classifiers(lines(parser.get("metadata", "classifiers", fallback="")))
     install = parser.get("options", "install_requires", fallback="")
     if install.strip().startswith("file:"):
@@ -185,11 +249,15 @@ def _setup_py(reader: _Reader) -> None:
         return
     names = module_literals(module, before=calls[0].lineno)
     for keyword in calls[0].keywords:
-        if keyword.arg not in {"classifiers", "install_requires", "extras_require"}:
+        if keyword.arg not in {"name", "classifiers", "install_requires", "extras_require"}:
             continue
         value: Any = literal(keyword.value, names)
         if value is UNKNOWN:
+            if keyword.arg == "name":
+                continue
             reader.note(f"setup.py: {keyword.arg} is computed when setup.py runs; not read")
+        elif keyword.arg == "name":
+            reader.add_name(value)
         elif keyword.arg == "classifiers":
             reader.add_classifiers(value)
         elif keyword.arg == "install_requires":
@@ -212,6 +280,7 @@ def read_metadata(tree: TreeSource) -> ProjectMetadata:
     _setup_cfg(reader)
     _setup_py(reader)
     return ProjectMetadata(
+        name=reader.name,
         classifiers=tuple(reader.classifiers),
         dependencies=tuple(reader.dependencies),
         extras={name: tuple(values) for name, values in sorted(reader.extras.items())},

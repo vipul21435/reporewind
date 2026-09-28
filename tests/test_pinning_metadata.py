@@ -70,7 +70,11 @@ speed = ["ujson", "undeclared"]
     )
     meta = read_metadata(tree)
     assert meta.classifiers == ("Programming Language :: Python :: 3.8",)
-    assert meta.dependencies == ("requests<3,>=2.25", "ujson<5,>=4.0")
+    # ujson is optional = true: Poetry installs it only through the speed extra.
+    assert meta.name == "demo"
+    assert meta.dependencies == ("requests<3,>=2.25",)
+    assert meta.requirements(()) == ("requests<3,>=2.25",)
+    assert meta.requirements(["speed"]) == ("requests<3,>=2.25", "ujson<5,>=4.0")
     assert meta.extras == {"speed": ("ujson<5,>=4.0",)}
     assert meta.notes == (
         "pyproject.toml: poetry dependency skipped: local is installed from a path source,"
@@ -177,3 +181,79 @@ def test_first_file_with_classifiers_wins_and_dependencies_merge() -> None:
 
 def test_empty_tree_has_no_metadata() -> None:
     assert read_metadata(MemoryTreeSource({"README.md": "hi"})) == ProjectMetadata()
+
+
+def test_self_referencing_extras_expand_to_this_commits_extras() -> None:
+    tree = MemoryTreeSource(
+        {
+            "pyproject.toml": """
+[project]
+name = "Attrs"
+dependencies = ["importlib_metadata; python_version < '3.8'"]
+
+[project.optional-dependencies]
+tests-no-zope = ["mypy>=1.1.1", "pytest"]
+tests = ["attrs[tests-no-zope]", "zope.interface"]
+cov = ["attrs[tests]; python_version >= '3.8'", "coverage[toml]>=5.3"]
+loop = ["attrs[loop]", "six"]
+"""
+        }
+    )
+    meta = read_metadata(tree)
+    assert meta.name == "Attrs"
+    assert meta.requirements(["tests"]) == (
+        'importlib_metadata; python_version < "3.8"',
+        "mypy>=1.1.1",
+        "pytest",
+        "zope.interface",
+    )
+    assert meta.requirements(["cov"]) == (
+        'importlib_metadata; python_version < "3.8"',
+        'mypy>=1.1.1; python_version >= "3.8"',
+        'pytest; python_version >= "3.8"',
+        'zope.interface; python_version >= "3.8"',
+        "coverage[toml]>=5.3",
+    )
+    # A cycle terminates, and dependency-group style lists expand the same way.
+    assert meta.requirements(["loop"])[1:] == ("six",)
+    assert meta.expand(["attrs[tests-no-zope]", "hypothesis"]) == (
+        "mypy>=1.1.1",
+        "pytest",
+        "hypothesis",
+    )
+
+
+def test_project_name_from_setup_cfg_and_setup_py() -> None:
+    cfg = read_metadata(MemoryTreeSource({"setup.cfg": "[metadata]\nname = demo\n"}))
+    assert cfg.name == "demo"
+    literal = read_metadata(MemoryTreeSource({"setup.py": "setup(name='lit')\n"}))
+    assert literal.name == "lit"
+    computed = read_metadata(MemoryTreeSource({"setup.py": "setup(name=NAME + 'x')\n"}))
+    assert computed.name is None
+    assert computed.notes == ()
+    assert read_metadata(MemoryTreeSource({})).expand(["attrs[x]"]) == ("attrs[x]",)
+
+
+def test_poetry_multiple_constraint_optional_dependency_is_skipped() -> None:
+    tree = MemoryTreeSource(
+        {
+            "pyproject.toml": """
+[tool.poetry]
+name = "demo"
+
+[tool.poetry.dependencies]
+six = "^1.15"
+numpy = [
+  { version = "^1.20", python = ">=3.8", optional = true },
+  { version = "^1.19", python = "<3.8", optional = true },
+]
+pyyaml = { version = "^5.4", optional = true }
+
+[tool.poetry.extras]
+yaml = ["pyyaml"]
+"""
+        }
+    )
+    meta = read_metadata(tree)
+    assert meta.dependencies == ("six<2,>=1.15",)
+    assert meta.requirements(["yaml"]) == ("six<2,>=1.15", "pyyaml<6,>=5.4")

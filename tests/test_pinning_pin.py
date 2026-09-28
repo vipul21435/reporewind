@@ -142,3 +142,19 @@ def test_pin_result_rejects_unknown_fields() -> None:
     data["extra"] = 1
     with pytest.raises(ValueError, match="extra"):
         PinResult.model_validate(data)
+
+
+def test_self_referencing_extras_are_not_resolved_from_the_index() -> None:
+    pyproject = """
+[project]
+name = "demo"
+dependencies = ["click>=7"]
+
+[project.optional-dependencies]
+tests-core = ["mypy>=1.1.1"]
+tests = ["demo[tests-core]", "zope.interface"]
+"""
+    tree = MemoryTreeSource({"pyproject.toml": pyproject})
+    recipe = Recipe(extras=("tests",), test_dependencies=("pytest", "Demo[tests-core]"))
+    result, _ = pin_commit(tree, RepoRef.parse("example/demo"), commit(), recipe, runner())
+    assert result.requirements == ("click>=7", "mypy>=1.1.1", "zope.interface", "pytest")

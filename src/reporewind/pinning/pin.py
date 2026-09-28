@@ -96,7 +96,8 @@ def pin_commit(
     image, image_notes = resolve_base_image(choice.version, runner, offline=options.offline)
     installs_project = recipe.install in {InstallMode.EDITABLE, InstallMode.PACKAGE}
     project = metadata.requirements(recipe.extras) if installs_project else ()
-    requirements = tuple(dict.fromkeys((*project, *recipe.test_dependencies)))
+    # Test dependencies may name the project's own extras too (dependency groups).
+    requirements = metadata.expand((*project, *recipe.test_dependencies))
     cutoff = options.exclude_newer or commit.committer_date
     lock = compile_lock(
         tree,
