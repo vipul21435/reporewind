@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := help
 UV ?= uv
 
-.PHONY: help install lint format typecheck test cov e2e demo clean
+.PHONY: help install lint format typecheck test cov e2e demo sample clean
 
 help: ## List available targets
 	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-10s %s\n", $$1, $$2}'
@@ -30,8 +30,11 @@ cov: ## Offline test suite with branch coverage (fails under 85%)
 e2e: ## Network/Docker end-to-end tests
 	$(UV) run pytest -q -m e2e
 
-demo: ## End-to-end demo (full pipeline lands with the demo slice)
-	$(UV) run reporewind --version
+demo: ## Offline end-to-end demo on the bundled sample repository
+	$(UV) run sh demo/run.sh
+
+sample: ## Regenerate demo/slugkit.fi from demo/make_sample.py
+	$(UV) run python demo/make_sample.py
 
 clean: ## Remove caches and coverage output
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage coverage.xml htmlcov

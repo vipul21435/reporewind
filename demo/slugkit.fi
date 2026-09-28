@@ -1,0 +1,216 @@
+blob
+mark :1
+data 10
+# slugkit
+
+blob
+mark :2
+data 71
+[project]
+name = "slugkit"
+version = "0.1.0"
+requires-python = ">=3.9"
+
+blob
+mark :3
+data 56
+from slugkit.core import slugify
+
+__all__ = ["slugify"]
+
+blob
+mark :4
+data 242
+"""Turn titles into URL slugs."""
+
+import re
+
+_UNSAFE = re.compile(r"[^a-z0-9]")
+
+
+def slugify(title, sep="-"):
+    """Lowercase ``title`` and replace every unsafe character with ``sep``."""
+    return _UNSAFE.sub(sep, title.strip().lower())
+
+blob
+mark :5
+data 168
+import unittest
+
+from slugkit import slugify
+
+
+class SlugifyTest(unittest.TestCase):
+    def test_lowercases(self):
+        self.assertEqual(slugify("Hello"), "hello")
+
+reset refs/tags/fix-separators
+commit refs/tags/fix-separators
+mark :6
+author RepoRewind Fixture <fixture@example.invalid> 1614834367 +0000
+committer RepoRewind Fixture <fixture@example.invalid> 1614834367 +0000
+data 22
+chore: initial commit
+M 100644 :1 README.md
+M 100644 :2 pyproject.toml
+M 100644 :3 src/slugkit/__init__.py
+M 100644 :4 src/slugkit/core.py
+M 100644 :5 tests/test_core.py
+
+blob
+mark :7
+data 53
+# slugkit
+
+    slugify("Hello World")  # hello-world
+
+commit refs/tags/fix-separators
+mark :8
+author RepoRewind Fixture <fixture@example.invalid> 1614837967 +0000
+committer RepoRewind Fixture <fixture@example.invalid> 1614837967 +0000
+data 16
+docs: add usage
+from :6
+M 100644 :7 README.md
+
+blob
+mark :9
+data 59
+- slugify collapses runs of separators and trims both ends
+
+blob
+mark :10
+data 255
+"""Turn titles into URL slugs."""
+
+import re
+
+_UNSAFE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(title, sep="-"):
+    """Lowercase ``title``; collapse each run of unsafe characters into one ``sep``."""
+    return _UNSAFE.sub(sep, title.lower()).strip(sep)
+
+blob
+mark :11
+data 288
+import unittest
+
+from slugkit import slugify
+
+
+class SlugifyTest(unittest.TestCase):
+    def test_lowercases(self):
+        self.assertEqual(slugify("Hello"), "hello")
+
+    def test_collapses_runs_of_separators(self):
+        self.assertEqual(slugify("  Hello,  World! "), "hello-world")
+
+commit refs/tags/fix-separators
+mark :12
+author RepoRewind Fixture <fixture@example.invalid> 1614841567 +0000
+committer RepoRewind Fixture <fixture@example.invalid> 1614841567 +0000
+data 44
+fix: collapse runs of separators in slugify
+from :8
+M 100644 :9 CHANGES.md
+M 100644 :10 src/slugkit/core.py
+M 100644 :11 tests/test_core.py
+
+blob
+mark :13
+data 23
+# slugkit
+
+Python 3.9+
+
+commit refs/tags/merge-unicode
+mark :14
+author RepoRewind Fixture <fixture@example.invalid> 1614845167 +0000
+committer RepoRewind Fixture <fixture@example.invalid> 1614845167 +0000
+data 37
+docs: list supported Python versions
+from :12
+M 100644 :13 README.md
+
+blob
+mark :15
+data 370
+"""Turn titles into URL slugs."""
+
+import re
+import unicodedata
+
+_UNSAFE = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(title, sep="-"):
+    """Lowercase ``title``; collapse each run of unsafe characters into one ``sep``."""
+    ascii_title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+    return _UNSAFE.sub(sep, ascii_title.lower()).strip(sep)
+
+blob
+mark :16
+data 209
+import unittest
+
+from slugkit import slugify
+
+
+class UnicodeTest(unittest.TestCase):
+    def test_transliterates_accents(self):
+        self.assertEqual(slugify("Cr\u00e8me br\u00fbl\u00e9e"), "creme-brulee")
+
+commit refs/heads/unicode-slugs
+mark :17
+author RepoRewind Fixture <fixture@example.invalid> 1614848767 +0000
+committer RepoRewind Fixture <fixture@example.invalid> 1614848767 +0000
+data 61
+fix: transliterate accented letters instead of dropping them
+from :12
+M 100644 :15 src/slugkit/core.py
+M 100644 :16 tests/test_unicode.py
+
+commit refs/tags/merge-unicode
+mark :18
+author RepoRewind Fixture <fixture@example.invalid> 1614852367 +0000
+committer RepoRewind Fixture <fixture@example.invalid> 1614852367 +0000
+data 49
+Merge pull request #7 from example/unicode-slugs
+from :14
+merge :17
+M 100644 :15 src/slugkit/core.py
+M 100644 :16 tests/test_unicode.py
+
+blob
+mark :19
+data 398
+"""Turn titles into URL slugs."""
+
+import re
+import unicodedata
+
+_UNSAFE_RUN = re.compile(r"[^a-z0-9]+")
+
+
+def _to_ascii(text):
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+
+
+def slugify(title, sep="-"):
+    """Lowercase ``title``; collapse each run of unsafe characters into one ``sep``."""
+    return _UNSAFE_RUN.sub(sep, _to_ascii(title).lower()).strip(sep)
+
+commit refs/heads/main
+mark :20
+author RepoRewind Fixture <fixture@example.invalid> 1614855967 +0000
+committer RepoRewind Fixture <fixture@example.invalid> 1614855967 +0000
+data 38
+refactor: name the ASCII folding step
+from :18
+M 100644 :19 src/slugkit/core.py
+
+reset refs/tags/refactor-only
+from :20
+

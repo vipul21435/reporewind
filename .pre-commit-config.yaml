@@ -6,8 +6,11 @@ repos:
     hooks:
       - id: check-yaml
       - id: check-toml
+      # demo/slugkit.fi is git fast-export output, kept byte-exact (a test checks it).
       - id: end-of-file-fixer
+        exclude: ^demo/slugkit\.fi$
       - id: trailing-whitespace
+        exclude: ^demo/slugkit\.fi$
       - id: check-added-large-files
         args: ["--maxkb=500"]
       - id: detect-private-key
