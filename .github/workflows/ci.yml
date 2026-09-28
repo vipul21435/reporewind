@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: lint, typecheck, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Resolver tests read commit history, so fetch the full graph.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install locked dependencies
+        run: uv sync --locked --python 3.12
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: mypy (strict)
+        run: uv run mypy
+
+      - name: pytest with coverage (offline suite)
+        env:
+          GIT_AUTHOR_NAME: ci
+          GIT_AUTHOR_EMAIL: ci@example.invalid
+          GIT_COMMITTER_NAME: ci
+          GIT_COMMITTER_EMAIL: ci@example.invalid
+        run: uv run pytest -q --cov --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
