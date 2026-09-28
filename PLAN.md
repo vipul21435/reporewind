@@ -161,6 +161,49 @@ commit, then exports the result as a schema-validated task bundle.
     an offline test validates every committed recipe and an `e2e` test
     re-detects them from GitHub and compares the `detected` layer.
 
+- **Slice 4 decisions (pinning).**
+  - The pinned commit is the one that gets built (the fix's parent, or
+    `--at-rev`), and "the commit date" is its *committer* date (when it
+    landed), compared in UTC.
+  - Python choice: supported minor versions (3.7 to 3.14, which have
+    `python:X.Y-slim` images and resolver support) whose `X.Y.0` was out
+    on that day, filtered by the recipe's constraint; a minor version
+    satisfies it if its `.0` or a late patch release does (`>=3.8.1`
+    admits 3.8). Classifiers narrow the choice only when they intersect
+    the candidates (attrs lists 3.15, unreleased on its commit date, so it
+    never becomes a candidate); otherwise a note says they were ignored. A commit older than
+    3.7 falls back to 3.7 with a note; a constraint nothing released
+    satisfies is a `PinError`. `--python` wins but conflicts become notes.
+  - Classifiers and runtime requirements are read by a separate static
+    reader (`pinning.metadata`) rather than stored in the recipe: the
+    recipe holds environment choices a human reviews, while these are
+    facts of the commit. The `setup.py` literal readers moved to
+    `recipes.static` so both readers share them.
+  - Lock inputs: runtime requirements (plus the recipe's extras) only for
+    `editable`/`package` installs, the recipe's test dependencies, and the
+    requirements files copied from the tree at their repository paths so
+    relative `-r`/`-c` includes resolve (depth limit 10, paths outside the
+    repository dropped with a note). Lines that install the project itself
+    (`-e .`, local paths, `file:`) are dropped, so the host never runs the
+    project's build backend; slice 5 installs the project with
+    `--no-deps` on top of the lock.
+  - uv runs with `--no-config`, `--no-header`, `UV_*` variables scrubbed
+    (except `UV_CACHE_DIR`), and in a scratch directory, so the `# via`
+    annotations are stable relative paths and the lock is reproducible. A
+    two-line reporewind header records the interpreter, platform and
+    cutoff; the lock's sha256 goes into the `PinResult`. Hashes are on by
+    default; the platform defaults to `x86_64-unknown-linux-gnu`.
+  - Base image digests are the multi-platform *index* digest from
+    `docker buildx imagetools inspect --format '{{json .Manifest}}'` (no
+    pull). Any lookup failure falls back to a table recorded on 2026-09-29
+    with a note in the result; offline mode never calls docker. A test
+    ties the table's 3.12 entry to the digest pinned in `Dockerfile`.
+  - `pin.json` and `requirements.lock` default to
+    `$REPOREWIND_HOME/pins/<host>/<owner>__<repo>/<sha>/`; they are build
+    inputs, not reviewed files, so they are not committed like recipes.
+    Unit tests use a scripted `CommandRunner` (`tests/fakes.py`); two
+    `e2e` tests run the real uv resolver and registry lookup.
+
 ## Target layout
 
 ```
@@ -192,7 +235,7 @@ tests, green lint (ruff), strict typecheck (mypy) and a green suite.
 
 3. [x] **Build recipes: schema, detection and store** (done 2026-09-29) - Define a pydantic `Recipe` (Python constraint, install mode, extras, requirements files, system packages, pre-install steps, test command, test framework, env) and detectors that read `pyproject.toml` (PEP 621, setuptools, poetry, hatch, flit), `setup.py` (parsed with `ast`, never executed), `setup.cfg`, `requirements*.txt` and `tox.ini` at the parent commit via `git show`. Store recipes as `recipes/<owner>__<repo>.yaml` where human overrides deep-merge over detected values and the result is validated; add a stable recipe hash (sha256 of canonical JSON) and `reporewind recipe detect|show|validate`.
 
-4. [ ] **Historical pinning: Python version, dependencies, base image** - Infer the Python version from `requires-python`, trove classifiers and a commit-date table of CPython release dates (newest release that existed at the commit and satisfies the constraints). Resolve dependencies as of the commit date with `uv pip compile --exclude-newer <commit-date> --python-version X.Y` behind a `CommandRunner` protocol (fake in unit tests). Resolve `python:X.Y-slim` to an immutable `@sha256:` digest via `docker buildx imagetools inspect`, with an offline fallback table and `REPOREWIND_OFFLINE`. Expose `reporewind pin`, which writes the lock file and a `PinResult`.
+4. [x] **Historical pinning: Python version, dependencies, base image** (done 2026-09-29) - Infer the Python version from `requires-python`, trove classifiers and a commit-date table of CPython release dates (newest release that existed at the commit and satisfies the constraints). Resolve dependencies as of the commit date with `uv pip compile --exclude-newer <commit-date> --python-version X.Y` behind a `CommandRunner` protocol (fake in unit tests). Resolve `python:X.Y-slim` to an immutable `@sha256:` digest via `docker buildx imagetools inspect`, with an offline fallback table and `REPOREWIND_OFFLINE`. Expose `reporewind pin`, which writes the lock file and a `PinResult`.
 
 5. [ ] **Dockerfile generation, build cache and build lock** - Render a deterministic Dockerfile (base image by digest, non-root user, locked requirements installed with uv, repository checked out at the parent SHA, no network needed at test time) with golden-file tests. Tag images by a content hash of recipe + lock + base digest, keep a JSON build-cache index so an identical environment is never rebuilt, and guard builds with a cross-process file lock (timeout, stale-lock recovery) proven by a multiprocessing test in which N concurrent builders produce exactly one build. Expose `reporewind build` with `--dry-run`.
 

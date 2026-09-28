@@ -8,13 +8,15 @@ Rebuild an open-source Python repository at any historical commit inside a
 digest-pinned Docker image, then prove that a fix commit flips its tests from
 failing to passing.
 
-> **Status.** The first two pipeline stages are complete. **Resolve**: a
+> **Status.** The first three pipeline stages are complete. **Resolve**: a
 > fix commit or a merged GitHub pull request becomes a base commit plus a
 > source patch and a test patch, with a proof that the split is exact.
 > **Recipe**: the base commit's packaging metadata becomes a validated build
-> recipe, stored as YAML with human overrides and a stable hash. They ship
-> with a hermetic git layer, an offline demo and a digest-pinned CLI image.
-> Historical pinning, environment builds, automated fail-to-pass
+> recipe, stored as YAML with human overrides and a stable hash. **Pin**:
+> the base commit gets the Python version it was built with, a dependency
+> lock as of its commit date and a `python:X.Y-slim` base image pinned by
+> digest. They ship with a hermetic git layer, an offline demo and a
+> digest-pinned CLI image. Environment builds, automated fail-to-pass
 > verification and bundle export are **not built yet**; they are listed
 > under [Roadmap](#roadmap) and tracked in [PLAN.md](PLAN.md).
 
@@ -84,6 +86,30 @@ are included.
   value came from (a test pins the hash of the default recipe).
   `reporewind recipe show` prints the merged recipe and its hash;
   `reporewind recipe validate` checks every committed recipe.
+- **Pin the Python version of a historical commit** (`reporewind pin
+  OWNER/REPO FIX`): the newest CPython minor version that was already
+  released on the commit date (a table of `X.Y.0` release dates, compared
+  in UTC), satisfies the recipe's `requires-python` constraint and, when
+  the project lists `Programming Language :: Python :: X.Y` classifiers,
+  is one of them. The reason and the candidate list are recorded;
+  `--python X.Y` overrides it.
+- **Lock dependencies as of the commit date**: `uv pip compile
+  --exclude-newer <commit date> --python-version X.Y --python-platform
+  x86_64-unknown-linux-gnu --generate-hashes` over the project's runtime
+  requirements (read statically from `pyproject.toml`, Poetry tables,
+  `setup.cfg` or `setup.py` via `ast`) plus its recipe extras, the recipe's
+  test dependencies and its requirements files with their `-r`/`-c`
+  includes. Lines that install the project itself (`-e .`) are dropped, so
+  the host never runs the project's build backend. uv runs behind the
+  `CommandRunner` protocol, so unit tests use a scripted fake.
+- **Pin the base image by digest**: `python:X.Y-slim` is resolved to its
+  multi-platform index digest with `docker buildx imagetools inspect`; if
+  that fails, or `REPOREWIND_OFFLINE=1` / `--offline` is set, the digest
+  comes from a recorded table and the result says so in a note.
+- **`PinResult`**: `pin.json` beside `requirements.lock` records the
+  commit and its date, the recipe hash, the Python choice with its reason,
+  the base image reference, the cutoff, the platform, the lock's sha256 and
+  every pinned package. Pinning failures exit with code 12.
 - **Offline demo and CLI image**: `make demo` runs the whole resolve story on
   a bundled sample repository in a few seconds; `make docker-demo` runs the
   same demo inside a non-root image built on a digest-pinned base.
@@ -342,6 +368,76 @@ Recipe fields: `python` (PEP 440 constraint), `install` (`editable`,
 `system_packages` (Debian), `pre_install` (shell steps), `test_framework`
 (`pytest` or `unittest`), `test_command` (argv) and `env`.
 
+### Historical pinning
+
+`reporewind pin` pins the commit that will be built (the fix's parent, as
+for recipes). It uses the stored recipe from `recipes/` (or detects one at
+that commit and says so in a note), then writes `requirements.lock` and
+`pin.json`, and prints the `PinResult` JSON on stdout. Real runs from the
+repository root on 2026-09-29, with the committed recipes:
+
+```console
+$ reporewind pin pallets/markupsafe e85aff4d878aa458d5c1e879bf475d8483647f71 --mainline 1 -o markupsafe-pin > /dev/null
+pinned pallets/markupsafe at 9c44ecf45141 (parent 1 of 2 of e85aff4d878a), committed 2024-10-16T21:07:04Z
+  python   3.13 (newest release out by 2024-10-16 that satisfies >=3.9)
+  image    python:3.13-slim@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b (registry)
+  lock     4 packages published up to 2024-10-16T21:07:04Z, x86_64-unknown-linux-gnu
+  recipe   sha256:de7c01a6a3100f122eacdb42330a00cc37058137964d09e690a1264de3d1736f
+  wrote    markupsafe-pin/requirements.lock
+  wrote    markupsafe-pin/pin.json
+
+$ head -12 markupsafe-pin/requirements.lock
+# Locked by reporewind for Python 3.13 on x86_64-unknown-linux-gnu
+# from packages published up to 2024-10-16T21:07:04Z (uv pip compile --exclude-newer).
+iniconfig==2.0.0 \
+    --hash=sha256:2d91e135bf72d31a410b17c16da610a82cb55f6b0477d1a902134b24a455b8b3 \
+    --hash=sha256:b6a85871a79d2e3b22d2d1b94ac2824226a63c6b741c88f7ae975f18b6778374
+    # via
+    #   -r repo/requirements/tests.txt
+    #   pytest
+packaging==24.1 \
+    --hash=sha256:026ed72c8ed3fcce5bf8950572258698927fd1dbda10a5e981cdf0ac37f4f002 \
+    --hash=sha256:5b8f2217dbdbd2f7f384c41c628544e6d52f2d0f53c6d0c3ea61aa5d1d7ff124
+    # via
+
+$ reporewind pin python-attrs/attrs f53fc5440d7f86aac4328aec7a563eb48634177f -o attrs-pin 2> /dev/null \
+    | jq '{python: .python.version, reason: .python.reason, classifiers: .python.classifiers,
+           image: .base_image.digest, exclude_newer, packages}'
+{
+  "python": "3.14",
+  "reason": "newest classifier version released by 2026-08-02 that satisfies >=3.10",
+  "classifiers": ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"],
+  "image": "sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d",
+  "exclude_newer": "2026-08-02T12:21:33+02:00",
+  "packages": ["cloudpickle==3.1.2", "execnet==2.1.2", "hypothesis==6.165.0", "iniconfig==2.3.0",
+               "packaging==26.2", "pluggy==1.6.0", "psutil==7.2.2", "pygments==2.20.0",
+               "pympler==1.1", "pytest==9.1.1", "pytest-xdist==3.8.0", "sortedcontainers==2.4.0"]
+}
+
+$ REPOREWIND_OFFLINE=1 reporewind pin python-attrs/attrs f53fc5440d7f86aac4328aec7a563eb48634177f -o attrs-pin-offline > /dev/null
+pinned python-attrs/attrs at f38b8a3f1625 (parent 1 of 1 of f53fc5440d7f), committed 2026-08-02T10:21:33Z
+  python   3.14 (newest classifier version released by 2026-08-02 that satisfies >=3.10)
+  image    python:3.14-slim@sha256:51dafde81dbdb6ebde285137a295cf18a47ca95234fe388a343719cb97305b3d (fallback)
+  lock     12 packages published up to 2026-08-02T10:21:33Z, x86_64-unknown-linux-gnu
+  recipe   sha256:99e289ae6268ad15022f392b296087fed505b0c7c699b49843f09912c0d117b2
+  note     REPOREWIND_OFFLINE: python:3.14-slim digest from the offline table recorded on 2026-09-29
+  wrote    attrs-pin-offline/requirements.lock
+  wrote    attrs-pin-offline/pin.json
+
+$ cmp attrs-pin/requirements.lock attrs-pin-offline/requirements.lock && echo same-lock
+same-lock
+```
+
+(The `jq` output is reflowed here to save space; the values are unchanged.)
+attrs lists a `3.15` classifier, but 3.15 was not released on the commit
+date, so 3.14 is chosen. markupsafe lists no version classifiers at that
+commit, so the newest release satisfying `>=3.9` wins. Offline, the digest
+comes from the recorded table (the same digest the registry returned) and
+uv resolves from its local cache (`uv pip compile --offline`), which is why
+the second attrs lock is byte-identical. `--exclude-newer DATE` moves the
+cutoff, `--python X.Y` fixes the interpreter, `--no-hashes` drops hashes and
+`--platform` changes the uv target.
+
 ### Command reference
 
 | Command | What it does |
@@ -358,13 +454,19 @@ Recipe fields: `python` (PEP 440 constraint), `install` (`editable`,
 | `--repo-dir`, `--source`, `--cache-dir`, `--recipes-dir` | Same repository options as `resolve`; recipe directory (default `recipes`) |
 | `reporewind recipe show OWNER/REPO [--json]` | Print the effective recipe (detected + overrides), its hash and the overridden fields |
 | `reporewind recipe validate [FILE...]` | Validate the given recipe files, or every `*.yaml` in `--recipes-dir` |
+| `reporewind pin OWNER/REPO FIX` | Pin the fix's parent: Python version, `requirements.lock` as of its commit date, base image digest; print the `PinResult` JSON |
+| `-o / --output-dir DIR` | Where `requirements.lock` and `pin.json` go (default `$REPOREWIND_HOME/pins/<host>/<owner>__<repo>/<sha>`) |
+| `--python X.Y`, `--exclude-newer DATE`, `--platform P`, `--no-hashes` | Fix the interpreter; move the cutoff (ISO 8601, UTC if no zone); uv target platform; lock without hashes |
+| `--offline` (or `REPOREWIND_OFFLINE=1`) | Recorded base-image digests and `uv pip compile --offline` |
+| `--at-rev`, `-m`, `--repo-dir`, `--source`, `--cache-dir`, `--recipes-dir`, `-q` | As for `recipe detect` |
 | `reporewind version` / `--version` | Print the version |
 
 Exit codes: 0 success, 2 bad input (invalid repo reference, split rule, or a
 short SHA without `--repo-dir`), 3 missing tool (git not on `PATH`), 4 failed
 git command, 10 resolve error (root commit, merge without a mainline, no test
 changes, unmerged PR, GitHub API error), 11 recipe error (invalid recipe
-file or override, missing recipe).
+file or override, missing recipe), 12 pin error (no Python release
+satisfies the constraint, uv could not resolve, no recorded digest).
 
 ### Docker
 
@@ -396,8 +498,13 @@ flowchart LR
     BASE --> DETECT["detect_recipe at base<br/>pyproject, setup.py (ast), setup.cfg,<br/>requirements, tox.ini"]
     DETECT --> STORE["recipes/owner__repo.yaml<br/>detected + overrides (RFC 7396)"]
     STORE --> RECIPE["validated Recipe<br/>sha256 recipe hash"]
-    JSON -.->|roadmap| NEXT["pin, build,<br/>verify, export"]
-    RECIPE -.->|roadmap| NEXT
+    RECIPE --> PY["choose_python<br/>commit date, requires-python,<br/>classifiers, CPython release table"]
+    PY --> IMG["resolve_base_image<br/>buildx imagetools inspect<br/>or recorded digests"]
+    PY --> LOCK["compile_lock<br/>uv pip compile --exclude-newer"]
+    IMG --> PIN["pin.json (PinResult)<br/>+ requirements.lock"]
+    LOCK --> PIN
+    JSON -.->|roadmap| NEXT["build, verify,<br/>export"]
+    PIN -.->|roadmap| NEXT
 ```
 
 | Module | Responsibility |
@@ -414,6 +521,12 @@ flowchart LR
 | `reporewind.recipes.poetry` | Poetry constraints and dependency tables to PEP 440 / PEP 508 |
 | `reporewind.recipes.source` | Read-only tree at a commit (object store, no checkout) or in memory |
 | `reporewind.recipes.store` | YAML recipe files: strict loading, validation, atomic writes |
+| `reporewind.recipes.static` | Static readers shared by detection and pinning (TOML tables, ini lines, `setup.py` literals) |
+| `reporewind.pinning.python` | CPython release table and the Python version choice |
+| `reporewind.pinning.metadata` | Classifiers and runtime requirements, read statically |
+| `reporewind.pinning.lock` | Stage resolver inputs and run `uv pip compile --exclude-newer` |
+| `reporewind.pinning.image` | `python:X.Y-slim` to an index digest, with the recorded fallback table |
+| `reporewind.pinning.pin` | `pin_commit`, `PinResult`, `pin.json` and lock writing |
 | `reporewind.gitops` | No-shell `Git` wrapper: fetch by SHA, diff, apply, scratch-index apply, worktrees |
 | `reporewind.models` / `errors` / `proc` | Frozen pydantic v2 models, typed error hierarchy, `CommandRunner` protocol |
 | `reporewind.testing` | `RepoFactory`: deterministic throwaway repositories (fixed identity and clock) |
@@ -425,14 +538,15 @@ produced each number is next to it.
 
 | What | Result | Command |
 |---|---|---|
-| Offline test suite | 399 passed, 4 deselected (e2e) | `make cov` |
-| Branch-inclusive coverage | 99.19% (gate: 85%) | `make cov` |
-| Network end-to-end tests (live GitHub API, git remotes, recipe re-detection) | 4 passed | `make e2e` |
+| Offline test suite | 475 passed, 6 deselected (e2e) | `make cov` |
+| Branch-inclusive coverage | 99.04% (gate: 85%) | `make cov` |
+| Network end-to-end tests (live GitHub API, git remotes, recipe re-detection, real `uv pip compile`, registry digest lookup) | 6 passed | `make e2e` |
+| Packages locked for markupsafe#477 / attrs#1606 bases | 4 / 12 | `reporewind pin ...` (see [Historical pinning](#historical-pinning)) |
 | Offline demo, wall clock | 3 s | `make demo` |
 | Cache size after resolving attrs#1606 vs a full bare clone | 1.0M vs 6.2M | `du -sh` on `$REPOREWIND_HOME/repos/github.com/*` and on `git clone --bare` |
 | Same for markupsafe#477 | 396K vs 1.2M | as above |
 | Image layers added on top of `python:3.12-slim` | git 109MB, venv 30MB | `docker history reporewind:local` |
-| Source / test code size | 4309 / 3800 lines | `wc -l src/reporewind/*.py src/reporewind/*/*.py` and `wc -l tests/*.py` |
+| Source / test code size | 5510 / 4811 lines | `cat src/reporewind/*.py src/reporewind/*/*.py \| wc -l` and `cat tests/*.py \| wc -l` |
 
 CI (GitHub Actions) runs ruff, ruff format, `mypy --strict` and the coverage
 suite on every push and pull request, and a second job builds the image and
@@ -475,6 +589,15 @@ runs the demo inside it.
 - **Bundled demo data as text.** The sample repository is a `git
   fast-import` stream rather than a binary bundle, so it is reviewable in a
   diff and regenerated deterministically by `make sample`.
+- **Pin to the commit date, not to today.** The interpreter is the newest
+  one that existed when the commit landed, and packages uploaded after that
+  moment are invisible to the resolver, so a 2021 commit is not tested
+  against 2026 releases. A registry digest is still today's rebuild of
+  `python:X.Y-slim`; the tag is historical, the bytes are pinned.
+- **Degrade loudly, not silently.** Without Docker or network, the base
+  image digest falls back to a recorded table and the `PinResult` carries
+  a note saying so; a unit test checks the table's 3.12 entry equals the
+  digest the CLI image's Dockerfile pins.
 - **Stable exit codes per error category**, so scripts and CI can tell bad
   input from a git failure from a commit that cannot prove a flip.
 
@@ -483,23 +606,19 @@ runs the demo inside it.
 Planned, **not built yet** (details and acceptance criteria in
 [PLAN.md](PLAN.md)):
 
-1. **Historical pinning** - infer the Python version from `requires-python`,
-   classifiers and CPython release dates; resolve dependencies as of the
-   commit date with `uv pip compile --exclude-newer`; resolve
-   `python:X.Y-slim` to a digest with an offline fallback table.
-2. **Environment builds** - deterministic Dockerfile per task, images tagged
+1. **Environment builds** - deterministic Dockerfile per task, images tagged
    by a content hash of recipe + lock + base digest, a JSON build-cache index
    and a cross-process build lock.
-3. **Automated verification** - JUnit XML parsing, local and Docker
+2. **Automated verification** - JUnit XML parsing, local and Docker
    executors, the fail-to-pass protocol with FAIL_TO_PASS / PASS_TO_PASS
    lists and a verdict, and flaky-test detection by re-runs.
-4. **Task bundles and service** - schema-validated `task.json`, patches,
+3. **Task bundles and service** - schema-validated `task.json`, patches,
    test lists, lock and a sha256 manifest; `reporewind run` end to end; a
    small FastAPI service with a job queue.
-5. **Compose and public demos** - `docker-compose.yml` for the API, a
+4. **Compose and public demos** - `docker-compose.yml` for the API, a
    manually triggered CI job for the e2e tests, and committed bundles for
    1-2 real public repositories.
-6. **Benchmarks and docs** - throughput and cold vs warm build timings under
+5. **Benchmarks and docs** - throughput and cold vs warm build timings under
    `bench/`, `docs/` pages and a changelog.
 
 ## Development
@@ -515,7 +634,9 @@ make sample           # regenerate demo/slugkit.fi from demo/make_sample.py
 Python 3.12, `src/` layout, dependencies locked in `uv.lock`. Recorded
 GitHub fixtures are refreshed by `tests/fixtures/github/record.sh`.
 Configuration via environment (see `.env.example`): `GITHUB_TOKEN`
-(optional) and `REPOREWIND_HOME` (cache location, default `.reporewind`).
+(optional), `REPOREWIND_HOME` (cache and pin location, default
+`.reporewind`) and `REPOREWIND_OFFLINE` (`1` for recorded base-image
+digests and `uv --offline`).
 
 ## License
 
