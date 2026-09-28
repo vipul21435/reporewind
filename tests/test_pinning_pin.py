@@ -158,3 +158,15 @@ tests = ["demo[tests-core]", "zope.interface"]
     recipe = Recipe(extras=("tests",), test_dependencies=("pytest", "Demo[tests-core]"))
     result, _ = pin_commit(tree, RepoRef.parse("example/demo"), commit(), recipe, runner())
     assert result.requirements == ("click>=7", "mypy>=1.1.1", "zope.interface", "pytest")
+
+
+def test_project_extras_named_in_a_requirements_file_are_locked_from_metadata() -> None:
+    tree = MemoryTreeSource(
+        {"pyproject.toml": PYPROJECT, "requirements-dev.txt": '-e ".[yaml]"  # dev\npytest\n'}
+    )
+    recipe = Recipe(install="none", requirements_files=("requirements-dev.txt",))
+    fake = runner()
+    result, _ = pin_commit(tree, RepoRef.parse("example/demo"), commit(), recipe, fake)
+    assert result.requirements == ("click>=7", "pyyaml")
+    assert fake.calls[1].inputs["repo/requirements-dev.txt"] == "pytest\n"
+    assert "requirements files install the project with extras yaml" in result.notes[-2]

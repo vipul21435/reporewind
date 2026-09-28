@@ -12,6 +12,7 @@ from reporewind.pinning.lock import (
     format_timestamp,
     lock_header,
     pinned_packages,
+    project_lines,
     uv_environment,
 )
 from reporewind.recipes.source import MemoryTreeSource
@@ -189,3 +190,39 @@ def test_real_uv_locks_as_of_the_commit_date() -> None:
         SubprocessRunner(),
     )
     assert "pytest==6.2.1" in result.packages
+
+
+@pytest.mark.parametrize(
+    ("line", "extras"),
+    [
+        ("-e .", ()),
+        ("-e.", ()),
+        (".", ()),
+        ("-e .[tests]", ("tests",)),
+        (".[tests]", ("tests",)),
+        ('-e ".[dev, docs]"', ("dev", "docs")),
+        ("--editable=./[dev]", ("dev",)),
+        ("-e .\t# tab comment", ()),
+        ("file:.[x]", ("x",)),
+    ],
+)
+def test_lines_installing_the_project_are_dropped_and_their_extras_kept(
+    line: str, extras: tuple[str, ...]
+) -> None:
+    runner = FakeRunner({"uv pip": ok(LOCK)})
+    tree = MemoryTreeSource({"requirements-dev.txt": line + "\npytest\n"})
+    compile_lock(tree, request(requirements_files=("requirements-dev.txt",)), runner)
+    assert runner.calls[0].inputs["repo/requirements-dev.txt"] == "pytest\n"
+    assert project_lines(tree, ("requirements-dev.txt",)) == extras
+
+
+def test_other_local_paths_are_dropped_without_project_extras() -> None:
+    tree = MemoryTreeSource(
+        {"r.txt": "-e ./plugins/extra[all]\n../sibling\n/abs/pkg\n-e git+https://x/y#egg=y\n"}
+    )
+    runner = FakeRunner({"uv pip": ok(LOCK)})
+    result = compile_lock(tree, request(requirements_files=("r.txt",)), runner)
+    assert runner.calls[0].inputs["repo/r.txt"] == "-e git+https://x/y#egg=y\n"
+    assert len(result.notes) == 3
+    assert project_lines(tree, ("r.txt",)) is None
+    assert project_lines(MemoryTreeSource({}), ()) is None

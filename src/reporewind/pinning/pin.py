@@ -30,7 +30,7 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
 from reporewind.errors import PinError
 from reporewind.models import CommitInfo, RepoRef, Sha
 from reporewind.pinning.image import BaseImage, resolve_base_image
-from reporewind.pinning.lock import DEFAULT_PLATFORM, LockRequest, compile_lock
+from reporewind.pinning.lock import DEFAULT_PLATFORM, LockRequest, compile_lock, project_lines
 from reporewind.pinning.metadata import read_metadata
 from reporewind.pinning.python import PythonChoice, choose_python
 from reporewind.proc import CommandRunner
@@ -95,7 +95,21 @@ def pin_commit(
     )
     image, image_notes = resolve_base_image(choice.version, runner, offline=options.offline)
     installs_project = recipe.install in {InstallMode.EDITABLE, InstallMode.PACKAGE}
-    project = metadata.requirements(recipe.extras) if installs_project else ()
+    extras = recipe.extras if installs_project else ()
+    # A requirements file may install the project too (-e .[tests]); that line
+    # is dropped from the lock, so its extras are locked from the metadata.
+    from_files = project_lines(tree, recipe.requirements_files)
+    file_notes: tuple[str, ...] = ()
+    if from_files is not None:
+        installs_project = True
+        extras = tuple(dict.fromkeys((*extras, *from_files)))
+        if from_files:
+            file_notes = (
+                "requirements files install the project with extras "
+                + ", ".join(from_files)
+                + "; their requirements were locked from the project metadata",
+            )
+    project = metadata.requirements(extras) if installs_project else ()
     # Test dependencies may name the project's own extras too (dependency groups).
     requirements = metadata.expand((*project, *recipe.test_dependencies))
     cutoff = options.exclude_newer or commit.committer_date
@@ -125,7 +139,7 @@ def pin_commit(
         packages=lock.packages,
         requirements=requirements,
         requirements_files=recipe.requirements_files,
-        notes=(*notes, *metadata.notes, *choice.notes, *image_notes, *lock.notes),
+        notes=(*notes, *metadata.notes, *choice.notes, *image_notes, *file_notes, *lock.notes),
     )
     return result, lock.text
 

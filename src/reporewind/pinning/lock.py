@@ -11,8 +11,10 @@ Inputs are staged in a scratch directory: a generated ``requirements.in``
 test dependencies) and the recipe's requirements files copied from the
 commit's tree at their repository paths, so relative ``-r``/``-c`` includes
 keep working. Lines that install the project itself (``-e .``, ``.``,
-local paths) are dropped: the project is installed separately, and
-resolving it would run its build backend on the host.
+``-e ".[tests]"``, ``-e.``) or other local paths are dropped: the project is
+installed separately, and resolving it would run its build backend on the
+host. :func:`project_lines` reports the extras such lines asked for, so the
+caller can lock the requirements of those extras from the commit's metadata.
 
 uv is reached through the :class:`~reporewind.proc.CommandRunner` protocol,
 so unit tests use a fake; an ``e2e`` test runs the real resolver.
@@ -45,8 +47,20 @@ MAX_INCLUDE_DEPTH = 10
 
 _INCLUDE = re.compile(r"^(-r|-c|--requirement|--constraint)(?:\s*=\s*|\s+|(?=\S))(\S+)$")
 _PINNED = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==(\S+)")
-# Lines that point at the project itself or at other local directories.
-_LOCAL = re.compile(r"^(?:-e\s+|--editable[\s=]+)?(?:\.|\.\.|\./.*|\.\./.*|/.*|file:.*)$")
+# Lines that point at the project itself or at other local directories,
+# optionally editable, quoted and with extras: -e ".[tests]", -e., ./pkg[x].
+_LOCAL = re.compile(
+    r"""^(?:(?:-e|--editable)(?:\s*=\s*|\s*))?(?P<q>["']?)"""
+    r"""(?P<path>\.{1,2}(?:/[^\s\[\]"']*)?|/[^\s\[\]"']*|file:[^\s\[\]"']*)"""
+    r"""(?:\[(?P<extras>[^\]]*)\])?(?P=q)$"""
+)
+_ROOT = frozenset({".", "./", "file:.", "file:./"})
+# A comment starts at a '#' at the start of a line or after any whitespace.
+_COMMENT = re.compile(r"(?:^|\s)#")
+
+
+def _strip_comment(raw: str) -> str:
+    return _COMMENT.split(raw, maxsplit=1)[0].strip()
 
 
 def format_timestamp(value: datetime) -> str:
@@ -80,19 +94,35 @@ class LockResult(BaseModel):
     notes: tuple[str, ...] = ()
 
 
-def _stage_file(
-    tree: TreeSource, path: str, root: Path, notes: list[str], seen: set[str], depth: int
-) -> None:
-    if path in seen:
+class _Walk:
+    """State of one pass over requirements files and their includes."""
+
+    def __init__(self, tree: TreeSource, root: Path | None) -> None:
+        self.tree = tree
+        self.root = root
+        self.notes: list[str] = []
+        self.seen: set[str] = set()
+        self.installs_project = False
+        self.extras: list[str] = []
+
+
+def _stage_file(walk: _Walk, path: str, depth: int) -> None:
+    if path in walk.seen:
         return
-    seen.add(path)
-    data = tree.read(path)
+    walk.seen.add(path)
+    notes = walk.notes
+    data = walk.tree.read(path)
     if data is None:
         raise PinError(f"requirements file {path} does not exist at this commit")
     kept: list[str] = []
     for raw in data.decode("utf-8-sig", "replace").splitlines():
-        line = raw.split(" #", 1)[0].strip()
-        if _LOCAL.fullmatch(line):
+        line = _strip_comment(raw)
+        if local := _LOCAL.fullmatch(line):
+            if local["path"] in _ROOT:
+                walk.installs_project = True
+                for extra in (local["extras"] or "").split(","):
+                    if extra.strip() and extra.strip() not in walk.extras:
+                        walk.extras.append(extra.strip())
             notes.append(f"{path}: dropped {line!r} (the project is installed separately)")
             continue
         if match := _INCLUDE.fullmatch(line):
@@ -105,25 +135,37 @@ def _stage_file(
                 continue
             if depth >= MAX_INCLUDE_DEPTH:
                 raise PinError(f"{path}: requirements includes nest deeper than {depth}")
-            _stage_file(tree, normalized, root, notes, seen, depth + 1)
+            _stage_file(walk, normalized, depth + 1)
         kept.append(raw)
-    target_path = root / REPO_DIR / path
+    if walk.root is None:
+        return
+    target_path = walk.root / REPO_DIR / path
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
 
 
 def stage_inputs(tree: TreeSource, request: LockRequest, root: Path) -> tuple[list[str], list[str]]:
     """Write the resolver inputs under ``root``; return (relative input paths, notes)."""
-    notes: list[str] = []
     inputs: list[str] = []
     if request.requirements:
         (root / INPUT_NAME).write_text("\n".join(request.requirements) + "\n", encoding="utf-8")
         inputs.append(INPUT_NAME)
-    seen: set[str] = set()
+    walk = _Walk(tree, root)
     for path in request.requirements_files:
-        _stage_file(tree, path, root, notes, seen, 0)
+        _stage_file(walk, path, 0)
         inputs.append(f"{REPO_DIR}/{path}")
-    return inputs, notes
+    return inputs, walk.notes
+
+
+def project_lines(tree: TreeSource, paths: Sequence[str]) -> tuple[str, ...] | None:
+    """Extras asked for by lines that install the project (``-e .[tests]``) in ``paths``.
+
+    ``None`` when no line installs the project; ``()`` when one does without extras.
+    """
+    walk = _Walk(tree, None)
+    for path in paths:
+        _stage_file(walk, path, 0)
+    return tuple(walk.extras) if walk.installs_project else None
 
 
 def uv_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -211,6 +253,7 @@ __all__ = [
     "format_timestamp",
     "lock_header",
     "pinned_packages",
+    "project_lines",
     "stage_inputs",
     "uv_environment",
 ]
