@@ -12,20 +12,36 @@ from reporewind.recipes.model import (
     recipe_hash,
 )
 from reporewind.recipes.source import GitTreeSource, MemoryTreeSource, TreeSource
+from reporewind.recipes.store import (
+    DEFAULT_RECIPES_DIR,
+    DetectedBlock,
+    RecipeFile,
+    RecipeStore,
+    dump_recipe_file,
+    load_recipe_file,
+    parse_recipe_file,
+)
 
 __all__ = [
+    "DEFAULT_RECIPES_DIR",
     "DEFAULT_TEST_COMMANDS",
     "RECIPE_SCHEMA_VERSION",
+    "DetectedBlock",
     "Detection",
     "Framework",
     "GitTreeSource",
     "InstallMode",
     "MemoryTreeSource",
     "Recipe",
+    "RecipeFile",
+    "RecipeStore",
     "TreeSource",
     "canonical_json",
     "detect_at",
     "detect_recipe",
+    "dump_recipe_file",
+    "load_recipe_file",
     "merge_patch",
+    "parse_recipe_file",
     "recipe_hash",
 ]
