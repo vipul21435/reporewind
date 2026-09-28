@@ -204,6 +204,47 @@ commit, then exports the result as a schema-validated task bundle.
     Unit tests use a scripted `CommandRunner` (`tests/fakes.py`); two
     `e2e` tests run the real uv resolver and registry lookup.
 
+- **Slice 5 decisions (build).**
+  - The Dockerfile is rendered from the recipe, the `PinResult` and the
+    lock text only, and `render_dockerfile` refuses a recipe whose hash or
+    a lock whose sha256 differs from `pin.json`. Golden files under
+    `tests/golden/` cover editable/pytest, package/unittest with system
+    packages, pre-install steps and env, and requirements-only recipes;
+    `REPOREWIND_UPDATE_GOLDEN=1` rewrites them.
+  - The repository enters the image as a `git archive` snapshot in the
+    build context (`src/`), not a clone: no `.git`, no network for the
+    source, and `SETUPTOOLS_SCM_PRETEND_VERSION` covers projects that take
+    their version from git (the slice 3 gap for attrs' hatch-vcs). The
+    project is installed with `uv pip install --no-deps` on top of the
+    lock, with `--exclude-newer` at the pin cutoff so the isolated build
+    backend is dated too. Requirements install as root; the image then
+    `chown`s `/repo` and switches to uid 10001.
+  - The environment key hashes recipe hash, lock sha256, base digest, repo,
+    commit and `RENDERER_VERSION` (bumped when the text changes for the
+    same inputs). The commit is part of the key because the snapshot is
+    baked into the image. Tags are `reporewind/<owner>__<repo>:env-<16 hex>`.
+  - The build lock is `flock` on `<build>/locks/<key>.lock`, not an
+    O_EXCL file with PID checks: the kernel drops it when the holder dies,
+    so a leftover file is recovered without guessing about PID reuse; the
+    holder writes its PID/host for timeout messages and truncates the file
+    on a clean release. `index.json` is rewritten atomically under its own
+    `index.lock`. `ensure_image` re-checks the index after taking the lock
+    (double-checked), and trusts an entry only while `docker image
+    inspect` still reports the same image id.
+  - The multiprocessing proof uses the `spawn` start method and a
+    file-backed fake builder (`tests/buildkit.py`) that sleeps inside the
+    build; with the lock replaced by a no-op the same test records six
+    builds.
+  - Review fixes folded into this slice: tox is the authority for
+    requirements files (factor-only files are never installed),
+    `module_literals` drops names changed in place or rebound, a
+    `test_framework` override drops the detected command and `Recipe`
+    rejects a command for the other runner, Poetry patch-level python
+    bounds use `python_full_version`, and recipe lookup is case-blind.
+  - Not done here: no live image build was measured (Docker Hub rate
+    limited the base pull on 2026-09-29); the executor that runs the
+    image with `--network none` arrives with slice 6.
+
 ## Target layout
 
 ```
@@ -237,7 +278,7 @@ tests, green lint (ruff), strict typecheck (mypy) and a green suite.
 
 4. [x] **Historical pinning: Python version, dependencies, base image** (done 2026-09-29) - Infer the Python version from `requires-python`, trove classifiers and a commit-date table of CPython release dates (newest release that existed at the commit and satisfies the constraints). Resolve dependencies as of the commit date with `uv pip compile --exclude-newer <commit-date> --python-version X.Y` behind a `CommandRunner` protocol (fake in unit tests). Resolve `python:X.Y-slim` to an immutable `@sha256:` digest via `docker buildx imagetools inspect`, with an offline fallback table and `REPOREWIND_OFFLINE`. Expose `reporewind pin`, which writes the lock file and a `PinResult`.
 
-5. [ ] **Dockerfile generation, build cache and build lock** - Render a deterministic Dockerfile (base image by digest, non-root user, locked requirements installed with uv, repository checked out at the parent SHA, no network needed at test time) with golden-file tests. Tag images by a content hash of recipe + lock + base digest, keep a JSON build-cache index so an identical environment is never rebuilt, and guard builds with a cross-process file lock (timeout, stale-lock recovery) proven by a multiprocessing test in which N concurrent builders produce exactly one build. Expose `reporewind build` with `--dry-run`.
+5. [x] **Dockerfile generation, build cache and build lock** (done 2026-09-29) - Render a deterministic Dockerfile (base image by digest, non-root user, locked requirements installed with uv, repository checked out at the parent SHA, no network needed at test time) with golden-file tests. Tag images by a content hash of recipe + lock + base digest, keep a JSON build-cache index so an identical environment is never rebuilt, and guard builds with a cross-process file lock (timeout, stale-lock recovery) proven by a multiprocessing test in which N concurrent builders produce exactly one build. Expose `reporewind build` with `--dry-run`.
 
 6. [ ] **Test runner, JUnit parsing and fail-to-pass verification** - Parse JUnit XML safely (defusedxml; pytest and unittest variants, failure vs error vs skip, parametrized ids, nested testsuites) into per-test outcomes. Add an `Executor` protocol with a local subprocess executor (used by integration tests on throwaway repos) and a Docker executor. Implement the flip protocol: parent + test patch must fail the selected tests, parent + fix + test patch must pass them; compute FAIL_TO_PASS and PASS_TO_PASS and a `Verdict` (valid, no-flip, broken-baseline, regression). Detect flaky tests by re-running N times and excluding inconsistent ones with a report. Expose `reporewind verify`.
 

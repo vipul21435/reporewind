@@ -8,16 +8,19 @@ Rebuild an open-source Python repository at any historical commit inside a
 digest-pinned Docker image, then prove that a fix commit flips its tests from
 failing to passing.
 
-> **Status.** The first three pipeline stages are complete. **Resolve**: a
+> **Status.** The first four pipeline stages are complete. **Resolve**: a
 > fix commit or a merged GitHub pull request becomes a base commit plus a
 > source patch and a test patch, with a proof that the split is exact.
 > **Recipe**: the base commit's packaging metadata becomes a validated build
 > recipe, stored as YAML with human overrides and a stable hash. **Pin**:
 > the base commit gets the Python version it was built with, a dependency
 > lock as of its commit date and a `python:X.Y-slim` base image pinned by
-> digest. They ship with a hermetic git layer, an offline demo and a
-> digest-pinned CLI image. Environment builds, automated fail-to-pass
-> verification and bundle export are **not built yet**; they are listed
+> digest. **Build**: the pin becomes a deterministic, digest-pinned,
+> non-root Dockerfile whose image is tagged by a content hash and built at
+> most once, behind a JSON cache index and a cross-process build lock (live
+> image builds have not been measured yet). They ship with a hermetic git
+> layer, an offline demo and a digest-pinned CLI image. Automated
+> fail-to-pass verification and bundle export are **not built yet**; they are listed
 > under [Roadmap](#roadmap) and tracked in [PLAN.md](PLAN.md).
 
 ## Why this exists
@@ -73,8 +76,19 @@ are included.
   to PEP 440, hatch environments), `setup.py`, `setup.cfg`,
   `requirements*.txt` and `tox.ini`.
 - **`setup.py` is never executed**: it is parsed with `ast`; literal
-  arguments, names bound to literals and list concatenation are read, and
-  anything computed at run time is reported as a note instead of guessed.
+  arguments, names bound to literals and list concatenation are read. A
+  name changed in place (`+=`, item assignment, `.append`/`.extend`),
+  bound in a loop or function, or rebound after the `setup()` call counts
+  as computed at run time, and anything computed at run time is reported
+  as a note instead of guessed.
+- **tox decides the requirements files**: when `tox.ini` names
+  requirements files, other test-ish files are noted, not installed, and
+  files tox uses only under a factor (`min: -r ...`) never are. On
+  pallets/flask 2.2.0 (`reporewind recipe detect pallets/flask
+  b17bb9ed563ab2857c0db9a07ec4e6407404c7be --at-rev --dry-run`, run on
+  2026-09-29) the recipe lists `requirements/tests.txt` alone instead of
+  also installing the conflicting `tests-pallets-min.txt` and
+  `tests-pallets-dev.txt`.
 - **Recipes as reviewable YAML** (`recipes/<owner>__<repo>.yaml`): a
   `detected` layer (commit, backend, files read, notes) and hand-written
   `overrides` that survive re-detection. Overrides are a JSON Merge Patch
@@ -110,6 +124,30 @@ are included.
   commit and its date, the recipe hash, the Python choice with its reason,
   the base image reference, the cutoff, the platform, the lock's sha256 and
   every pinned package. Pinning failures exit with code 12.
+- **Deterministic per-task Dockerfile** (`reporewind build OWNER/REPO FIX
+  --dry-run`): rendered from the recipe, `pin.json` and `requirements.lock`
+  only, so the same inputs give the same bytes (three golden files in
+  `tests/golden/` pin the output). `FROM python:X.Y-slim@sha256:...` and
+  `uv` copied from a digest-pinned image; locked requirements installed with
+  `uv pip install --require-hashes --exclude-newer <cutoff>`; the snapshot
+  of the pinned commit copied from the build context (`git archive`, no
+  `.git`, no clone in the image); the project installed with `--no-deps`;
+  uid 10001; the recipe's test command as `CMD`. Everything the tests import
+  is installed at build time, so the image can run with `--network none`. A
+  recipe or lock that no longer matches `pin.json` is refused (exit 13).
+- **Content-addressed images and a build-cache index**: the environment key
+  is sha256 over the recipe hash, the lock sha256, the base digest, the
+  repository, the commit and the renderer version; the tag
+  `reporewind/<owner>__<repo>:env-<16 hex>` derives from it, and
+  `$REPOREWIND_HOME/build/index.json` maps each key to the image id built
+  for it. A key whose image is still present is a cache hit; a pruned image
+  is rebuilt instead of trusted.
+- **Cross-process build lock**: one `flock`ed lock file per key with a
+  timeout that names the holder's PID and host; a lock file left by a
+  killed builder is taken over (the kernel released it). After taking the
+  lock the builder re-reads the index, so N concurrent builders produce
+  exactly one build: a test starts 6 builder processes with `spawn` and
+  finds one build and five cache hits.
 - **Offline demo and CLI image**: `make demo` runs the whole resolve story on
   a bundled sample repository in a few seconds; `make docker-demo` runs the
   same demo inside a non-root image built on a digest-pinned base.
@@ -438,6 +476,65 @@ the second attrs lock is byte-identical. `--exclude-newer DATE` moves the
 cutoff, `--python X.Y` fixes the interpreter, `--no-hashes` drops hashes and
 `--platform` changes the uv target.
 
+### Environment builds
+
+`reporewind build` reads `pin.json` and `requirements.lock` for the commit
+that gets built, checks that the stored recipe and the lock still match
+them, and renders the Dockerfile. With `--dry-run` it prints the Dockerfile
+on stdout and the environment key, tag and cache state on stderr, without
+calling docker. A real run on 2026-09-29, after pinning into a scratch state
+directory with `reporewind pin ... --cache-dir "$STATE"`:
+
+```console
+$ reporewind build pallets/markupsafe e85aff4d878aa458d5c1e879bf475d8483647f71 --mainline 1 \
+    --cache-dir "$STATE" --dry-run
+# syntax=docker/dockerfile:1
+# Generated by reporewind (renderer 1); do not edit.
+# pallets/markupsafe at 9c44ecf45141f691d373a66ce664c43b5a6cc761, recipe sha256:de7c01a6a3100f122eacdb42330a00cc37058137964d09e690a1264de3d1736f
+FROM ghcr.io/astral-sh/uv:0.11.29@sha256:eb2843a1e56fd9e30c7276ce1a52cba86e64c7b385f5e3279a0e08e02dd058fc AS uv
+
+FROM python:3.13-slim@sha256:7c61056e61ac89e852de05f3dc6fa51a6dd2181797bceed46aa725dd7cb2cd3b
+LABEL project=reporewind \
+      org.reporewind.repo="pallets/markupsafe" \
+      org.reporewind.commit=9c44ecf45141f691d373a66ce664c43b5a6cc761 \
+      org.reporewind.recipe=sha256:de7c01a6a3100f122eacdb42330a00cc37058137964d09e690a1264de3d1736f
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    UV_NO_CACHE=1 \
+    UV_PYTHON_DOWNLOADS=never \
+    SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0+reporewind
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=uv /uv /usr/local/bin/uv
+RUN useradd --create-home --uid 10001 rewind
+COPY requirements.lock /opt/reporewind/requirements.lock
+RUN uv pip install --system --exclude-newer 2024-10-16T21:07:04Z --require-hashes -r /opt/reporewind/requirements.lock
+WORKDIR /repo
+COPY --chown=10001:10001 src/ /repo/
+RUN uv pip install --system --exclude-newer 2024-10-16T21:07:04Z --no-deps -e .
+RUN chown -R 10001:10001 /repo
+USER 10001:10001
+CMD ["python", "-m", "pytest", "-rA"]
+dry run: pallets/markupsafe at 9c44ecf45141
+  key      sha256:eae253fe22b35708341491d9b14393b03f80a6c5a25dfa07dfd8f9d51c33dc15
+  tag      reporewind/pallets__markupsafe:env-eae253fe22b35708 (not built yet)
+  context  Dockerfile, requirements.lock, src/ (git archive of 9c44ecf45141)
+  run      docker run --rm --network none reporewind/pallets__markupsafe:env-eae253fe22b35708
+```
+
+Without `--dry-run`, `build` takes the environment's lock, exports the
+snapshot into a temporary build context, runs `docker build --label
+project=reporewind --tag <tag>`, records the image id in the index and
+prints `{"key", "tag", "image_id", "status": "built" | "cached"}`. That
+path is covered by tests with a scripted docker; the live run above could
+not go further on 2026-09-29 because Docker Hub answered the base-image
+pull with `429 Too Many Requests` (exit 4, nothing recorded in the index,
+the lock released). `SETUPTOOLS_SCM_PRETEND_VERSION` lets projects that
+take their version from git metadata (setuptools-scm, hatch-vcs) install
+from the `.git`-less snapshot.
+
 ### Command reference
 
 | Command | What it does |
@@ -459,6 +556,10 @@ cutoff, `--python X.Y` fixes the interpreter, `--no-hashes` drops hashes and
 | `--python X.Y`, `--exclude-newer DATE`, `--platform P`, `--no-hashes` | Fix the interpreter; move the cutoff (ISO 8601, UTC if no zone); uv target platform; lock without hashes |
 | `--offline` (or `REPOREWIND_OFFLINE=1`) | Recorded base-image digests and `uv pip compile --offline` |
 | `--at-rev`, `-m`, `--repo-dir`, `--source`, `--cache-dir`, `--recipes-dir`, `-q` | As for `recipe detect` |
+| `reporewind build OWNER/REPO FIX` | Render the Dockerfile for the pinned parent and build its image once (cache index + build lock); print the outcome JSON |
+| `--dry-run` | Print the Dockerfile, key, tag and cache state; never call docker |
+| `--pin-dir DIR`, `--lock-timeout SECONDS` | Where `pin.json` and `requirements.lock` are (default: the `pin` default); how long to wait for another builder of the same image (default 1800) |
+| `--at-rev`, `-m`, `--repo-dir`, `--source`, `--cache-dir`, `--recipes-dir` | As for `pin`; the build cache lives in `<cache-dir>/build` |
 | `reporewind version` / `--version` | Print the version |
 
 Exit codes: 0 success, 2 bad input (invalid repo reference, split rule, or a
@@ -466,7 +567,9 @@ short SHA without `--repo-dir`), 3 missing tool (git not on `PATH`), 4 failed
 git command, 10 resolve error (root commit, merge without a mainline, no test
 changes, unmerged PR, GitHub API error), 11 recipe error (invalid recipe
 file or override, missing recipe), 12 pin error (no Python release
-satisfies the constraint, uv could not resolve, no recorded digest).
+satisfies the constraint, uv could not resolve, no recorded digest), 13
+build error (no `pin.json`, recipe or lock changed since pinning, build
+lock timeout, corrupt cache index).
 
 ### Docker
 
@@ -503,8 +606,11 @@ flowchart LR
     PY --> LOCK["compile_lock<br/>uv pip compile --exclude-newer"]
     IMG --> PIN["pin.json (PinResult)<br/>+ requirements.lock"]
     LOCK --> PIN
-    JSON -.->|roadmap| NEXT["build, verify,<br/>export"]
-    PIN -.->|roadmap| NEXT
+    PIN --> DOCKERFILE["render_dockerfile<br/>golden-file tested"]
+    DOCKERFILE --> ENSURE["ensure_image<br/>content key, index.json,<br/>flock build lock"]
+    ENSURE --> IMAGE["reporewind/owner__repo:env-hash"]
+    JSON -.->|roadmap| NEXT["verify,<br/>export"]
+    IMAGE -.->|roadmap| NEXT
 ```
 
 | Module | Responsibility |
@@ -527,6 +633,9 @@ flowchart LR
 | `reporewind.pinning.lock` | Stage resolver inputs and run `uv pip compile --exclude-newer` |
 | `reporewind.pinning.image` | `python:X.Y-slim` to an index digest, with the recorded fallback table |
 | `reporewind.pinning.pin` | `pin_commit`, `PinResult`, `pin.json` and lock writing |
+| `reporewind.build.dockerfile` | Deterministic Dockerfile from recipe + `PinResult` + lock |
+| `reporewind.build.cache` | Environment key, image tag, `index.json`, `DockerBuilder`, `ensure_image` |
+| `reporewind.build.lock` | `BuildLock`: `flock` with timeout, holder record, stale-lock takeover |
 | `reporewind.gitops` | No-shell `Git` wrapper: fetch by SHA, diff, apply, scratch-index apply, worktrees |
 | `reporewind.models` / `errors` / `proc` | Frozen pydantic v2 models, typed error hierarchy, `CommandRunner` protocol |
 | `reporewind.testing` | `RepoFactory`: deterministic throwaway repositories (fixed identity and clock) |
@@ -538,15 +647,16 @@ produced each number is next to it.
 
 | What | Result | Command |
 |---|---|---|
-| Offline test suite | 475 passed, 6 deselected (e2e) | `make cov` |
-| Branch-inclusive coverage | 99.04% (gate: 85%) | `make cov` |
+| Offline test suite | 512 passed, 6 deselected (e2e) | `make cov` |
+| Branch-inclusive coverage | 98.81% (gate: 85%) | `make cov` |
+| Concurrent builders for one environment -> builds | 6 processes -> 1 build, 5 cache hits (1.45 s) | `uv run pytest -q tests/test_build_cache.py -k concurrent` |
 | Network end-to-end tests (live GitHub API, git remotes, recipe re-detection, real `uv pip compile`, registry digest lookup) | 6 passed | `make e2e` |
 | Packages locked for markupsafe#477 / attrs#1606 bases | 4 / 12 | `reporewind pin ...` (see [Historical pinning](#historical-pinning)) |
 | Offline demo, wall clock | 3 s | `make demo` |
 | Cache size after resolving attrs#1606 vs a full bare clone | 1.0M vs 6.2M | `du -sh` on `$REPOREWIND_HOME/repos/github.com/*` and on `git clone --bare` |
 | Same for markupsafe#477 | 396K vs 1.2M | as above |
 | Image layers added on top of `python:3.12-slim` | git 109MB, venv 30MB | `docker history reporewind:local` |
-| Source / test code size | 5510 / 4811 lines | `cat src/reporewind/*.py src/reporewind/*/*.py \| wc -l` and `cat tests/*.py \| wc -l` |
+| Source / test code size | 6264 / 5417 lines | `cat src/reporewind/*.py src/reporewind/*/*.py \| wc -l` and `cat tests/*.py \| wc -l` |
 
 CI (GitHub Actions) runs ruff, ruff format, `mypy --strict` and the coverage
 suite on every push and pull request, and a second job builds the image and
@@ -606,19 +716,17 @@ runs the demo inside it.
 Planned, **not built yet** (details and acceptance criteria in
 [PLAN.md](PLAN.md)):
 
-1. **Environment builds** - deterministic Dockerfile per task, images tagged
-   by a content hash of recipe + lock + base digest, a JSON build-cache index
-   and a cross-process build lock.
-2. **Automated verification** - JUnit XML parsing, local and Docker
+1. **Automated verification** - JUnit XML parsing, local and Docker
    executors, the fail-to-pass protocol with FAIL_TO_PASS / PASS_TO_PASS
    lists and a verdict, and flaky-test detection by re-runs.
-3. **Task bundles and service** - schema-validated `task.json`, patches,
+2. **Task bundles and service** - schema-validated `task.json`, patches,
    test lists, lock and a sha256 manifest; `reporewind run` end to end; a
    small FastAPI service with a job queue.
-4. **Compose and public demos** - `docker-compose.yml` for the API, a
+3. **Compose and public demos** - `docker-compose.yml` for the API, a
    manually triggered CI job for the e2e tests, and committed bundles for
    1-2 real public repositories.
-5. **Benchmarks and docs** - throughput and cold vs warm build timings under
+4. **Benchmarks and docs** - throughput and cold vs warm (cache-hit) live
+   image build timings under
    `bench/`, `docs/` pages and a changelog.
 
 ## Development
