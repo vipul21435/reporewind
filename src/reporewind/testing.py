@@ -18,6 +18,7 @@ The module has no pytest dependency; ``tests/conftest.py`` exposes it as the
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -151,12 +152,59 @@ class RepoFactory:
         return repo
 
 
+BUGGY_ADD = "def add(a, b):\n    return a - b\n"
+FIXED_ADD = "def add(a, b):\n    return a + b\n"
+TEST_ADD = "from calc.core import add\n\n\ndef test_add():\n    assert add(2, 3) == 5\n"
+
+
+@dataclass(frozen=True, slots=True)
+class BugfixRepo:
+    """A repository whose HEAD (``fix``) is a typical bug fix on top of ``base``."""
+
+    repo: FixtureRepo
+    base: str
+    fix: str
+
+
+def make_bugfix(factory: RepoFactory, name: str = "upstream") -> BugfixRepo:
+    """Build ``root -> base -> fix`` where the fix corrects ``src/calc/core.py``.
+
+    The fix commit edits one source file, adds ``tests/test_core.py`` (which
+    fails on ``base`` and passes on ``fix``) and adds a changelog entry, the
+    usual shape of a real bug-fix commit.
+    """
+    repo = factory.create(
+        name,
+        files={
+            "src/calc/__init__.py": "",
+            "src/calc/core.py": BUGGY_ADD,
+            "tests/conftest.py": "",
+            "README.md": "calc\n",
+        },
+    )
+    base = repo.commit("docs: usage", {"README.md": "calc\n\nadd(a, b)\n"})
+    fix = repo.commit(
+        "fix: add really adds",
+        {
+            "src/calc/core.py": FIXED_ADD,
+            "tests/test_core.py": TEST_ADD,
+            "CHANGELOG.md": "- add() adds\n",
+        },
+    )
+    return BugfixRepo(repo=repo, base=base, fix=fix)
+
+
 __all__ = [
+    "BUGGY_ADD",
+    "FIXED_ADD",
     "FIXTURE_EMAIL",
     "FIXTURE_EPOCH",
     "FIXTURE_NAME",
     "FIXTURE_STEP",
+    "TEST_ADD",
+    "BugfixRepo",
     "FileContent",
     "FixtureRepo",
     "RepoFactory",
+    "make_bugfix",
 ]

@@ -4,7 +4,16 @@ from pathlib import Path
 import pytest
 
 from reporewind.errors import GitError, InvalidPathError
-from reporewind.testing import FIXTURE_EMAIL, FIXTURE_EPOCH, FIXTURE_STEP, RepoFactory
+from reporewind.testing import (
+    BUGGY_ADD,
+    FIXED_ADD,
+    FIXTURE_EMAIL,
+    FIXTURE_EPOCH,
+    FIXTURE_STEP,
+    TEST_ADD,
+    RepoFactory,
+    make_bugfix,
+)
 
 # SHA of `create(files={"README.md": "hello\n"})`. Pinned so that a change in
 # identity, clock or git invocation that would make fixture SHAs machine- or
@@ -92,3 +101,17 @@ def test_branches_merges_renames_and_tags(repo_factory: RepoFactory) -> None:
     assert repo.git.rev_parse("v1.0") == base
     assert repo.git.list_files(merge) == ("README.md", "src/new/mod.py")
     assert repo.git.commit_date(merge) == FIXTURE_EPOCH + 3 * FIXTURE_STEP
+
+
+def test_bugfix_scenario_is_deterministic_and_well_formed(repo_factory: RepoFactory) -> None:
+    bugfix = make_bugfix(repo_factory)
+    assert (bugfix.base, bugfix.fix) == (
+        "08c803cf23c324844811a367b41c8b50bb016ad6",
+        "9adce53ef91b0a3d0856f8cb3bce59cdddc9728a",
+    )
+    git = bugfix.repo.git
+    assert git.parents(bugfix.fix) == (bugfix.base,)
+    assert git.read_file(bugfix.base, "src/calc/core.py") == BUGGY_ADD.encode()
+    assert git.read_file(bugfix.fix, "src/calc/core.py") == FIXED_ADD.encode()
+    assert git.read_file(bugfix.base, "tests/test_core.py") is None
+    assert git.read_file(bugfix.fix, "tests/test_core.py") == TEST_ADD.encode()

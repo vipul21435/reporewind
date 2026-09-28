@@ -9,7 +9,8 @@ Design rules, each of which exists because the opposite broke something:
   inherited ``GIT_DIR``-style variables (set by hooks) and config injected via
   the environment, so a diff or a SHA never depends on the machine it ran on.
   ``GIT_CEILING_DIRECTORIES`` stops git from walking up into an enclosing
-  repository when the target directory is not one itself.
+  repository when the target directory is not one itself, and local
+  ``git replace`` objects are ignored (``GIT_NO_REPLACE_OBJECTS``).
 * **Safe transports only.** ``GIT_ALLOW_PROTOCOL`` limits clones and fetches to
   file, git, http(s) and ssh; ``GIT_TERMINAL_PROMPT=0`` makes a credential
   prompt fail fast instead of hanging.
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import datetime
@@ -64,7 +66,7 @@ _SCRUBBED_ENV = frozenset(
 _SCRUBBED_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 _UNSAFE_REV = re.compile(r"[\s\x00-\x1f\x7f]")
 # NUL-separated so a subject line can contain any printable text.
-_COMMIT_FORMAT = "%H%x00%P%x00%aI%x00%cI%x00%s"
+_COMMIT_FORMAT = "%H%x00%aI%x00%cI%x00%s"
 
 
 def hermetic_env(
@@ -89,6 +91,7 @@ def hermetic_env(
             "GIT_ALLOW_PROTOCOL": ALLOWED_PROTOCOLS,
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_LITERAL_PATHSPECS": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
             "LC_ALL": "C",
         }
     )
@@ -276,14 +279,22 @@ class Git:
         )
         # Subjects are for humans; replace undecodable bytes rather than failing.
         fields = result.stdout.decode("utf-8", "replace").rstrip("\n").split("\x00")
-        full_sha, parents, author_date, committer_date, subject = fields
+        full_sha, author_date, committer_date, subject = fields
         return CommitInfo(
             sha=full_sha,
-            parents=tuple(parents.split()),
+            parents=self._recorded_parents(full_sha),
             author_date=datetime.fromisoformat(author_date),
             committer_date=datetime.fromisoformat(committer_date),
             subject=subject,
         )
+
+    def _recorded_parents(self, sha: str) -> tuple[str, ...]:
+        # Read the parents from the raw commit object: `%P` hides them for a
+        # commit at a shallow-fetch boundary, which would make it look like a
+        # root commit and make output depend on how much history was fetched.
+        raw = self.run("cat-file", "commit", sha).stdout
+        header = raw.split(b"\n\n", 1)[0].split(b"\n")
+        return tuple(line[7:].decode("ascii") for line in header if line.startswith(b"parent "))
 
     def parents(self, rev: str) -> tuple[str, ...]:
         """Parent SHAs of a commit, in order (empty for a root commit)."""
@@ -337,6 +348,26 @@ class Git:
         """Every file path in the tree of ``rev``, sorted, relative to the root."""
         out = self._text("ls-tree", "-r", "-z", "--name-only", "--full-tree", self.rev_parse(rev))
         return tuple(sorted(name for name in out.split("\x00") if name))
+
+    def tree_id(self, rev: str) -> str:
+        """Object id of the tree that commit ``rev`` records."""
+        sha = self.rev_parse(rev)
+        return self._text("rev-parse", "--verify", "--end-of-options", f"{sha}^{{tree}}").strip()
+
+    def shallow_commits(self) -> frozenset[str]:
+        """Commits at the boundary of a shallow fetch (their parents are missing)."""
+        raw = self._text("rev-parse", "--path-format=absolute", "--git-path", "shallow")
+        shallow = Path(raw.strip())
+        if not shallow.is_file():
+            return frozenset()
+        return frozenset(shallow.read_text(encoding="ascii").split())
+
+    def update_ref(self, ref: str, rev: str) -> None:
+        """Point ``ref`` (which must start with ``refs/``) at commit ``rev``."""
+        if not ref.startswith("refs/"):
+            raise ConfigError(f"invalid ref {ref!r}: must start with 'refs/'")
+        check_revision(ref)
+        self.run("update-ref", "--no-deref", ref, self.rev_parse(rev))
 
     # -- work trees and patches --------------------------------------------------
 
@@ -417,6 +448,35 @@ class Git:
         refuses paths that leave the work tree or pass through a symlink.
         """
         self._apply(patch, check_only=False, reverse=reverse)
+
+    def apply_to_tree(self, rev: str, *patches: str) -> str:
+        """Apply ``patches`` in order to the tree of ``rev``; return the resulting tree id.
+
+        The patches are applied to a scratch index (``git apply --cached``
+        with a temporary ``GIT_INDEX_FILE``), so HEAD, the real index, the
+        work tree and the worktree list are never touched: this is safe on a
+        user's own clone and works in a bare repository. Only the resulting
+        blobs and trees are written to the object store. Each patch is
+        applied on its own, so a :class:`PatchApplyError` names the one that
+        failed; empty patches are skipped.
+        """
+        sha = self.rev_parse(rev)
+        with tempfile.TemporaryDirectory(prefix="reporewind-index-") as scratch:
+            env = {"GIT_INDEX_FILE": str(Path(scratch) / "index")}
+            self.run("read-tree", sha, env=env)
+            for patch in patches:
+                if not patch:
+                    continue
+                self.run(
+                    "apply",
+                    "--cached",
+                    "--whitespace=nowarn",
+                    "-",
+                    stdin=patch.encode("utf-8", "surrogateescape"),
+                    env=env,
+                    error=PatchApplyError,
+                )
+            return self.run("write-tree", env=env).stdout_text.strip()
 
     def reset_work_tree(self) -> None:
         """Discard every change: tracked edits, untracked and ignored files."""
