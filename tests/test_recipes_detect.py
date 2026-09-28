@@ -551,3 +551,81 @@ test = ["pytest", {unknown = "x"}, 3]
     assert found.fields["test_dependencies"] == ["pytest"]
     assert found.fields["requirements_files"] == ["requirements/tests.txt"]
     assert any("python constraint {'version': '^3.8'} was not translated" in n for n in found.notes)
+
+
+def test_tox_factor_only_requirements_files_are_not_installed() -> None:
+    # The shape of a pallets repository: tox installs tests.txt always and the
+    # min/dev pins only under factors; installing all three is unsatisfiable.
+    found = detect(
+        {
+            "setup.py": "from setuptools import setup\nsetup(name='x')\n",
+            "requirements/tests.txt": "pytest==7.1.2\n",
+            "requirements/tests-pallets-min.txt": "werkzeug==2.0.0\n",
+            "requirements/tests-pallets-dev.txt": "https://example.invalid/main.tar.gz\n",
+            "requirements/docs.txt": "sphinx\n",
+            "tox.ini": (
+                "[testenv]\ndeps =\n    -r requirements/tests.txt\n"
+                "    min: -r requirements/tests-pallets-min.txt\n"
+                "    dev: -r requirements/tests-pallets-dev.txt\n"
+                "commands = pytest {posargs}\n"
+            ),
+        }
+    )
+    assert found.fields["requirements_files"] == ["requirements/tests.txt"]
+    assert any("tests-pallets-min.txt" in note for note in found.notes)
+
+
+def test_tox_requirements_are_the_authority_over_the_scan() -> None:
+    found = detect(
+        {
+            "setup.py": "from setuptools import setup\nsetup(name='x')\n",
+            "requirements.txt": "attrs\n",
+            "requirements/test.txt": "pytest\n",
+            "requirements/tests-oldest.txt": "pytest==6.0\n",
+            "tox.ini": "[testenv]\ndeps = -r requirements/test.txt\ncommands = pytest\n",
+        }
+    )
+    assert found.fields["requirements_files"] == ["requirements/test.txt", "requirements.txt"]
+    assert "requirements/tests-oldest.txt not installed: tox.ini's [testenv] does not use it" in (
+        found.notes
+    )
+
+
+@pytest.mark.parametrize(
+    "setup_py",
+    [
+        "tests_require = ['pytest']\ntests_require += ['mock', 'freezegun']\n"
+        "setup(name='x', tests_require=tests_require)\n",
+        "tests_require = ['pytest']\ntests_require.extend(['mock'])\n"
+        "setup(name='x', tests_require=tests_require)\n",
+        "reqs = ['pytest']\nsetup(name='x', tests_require=reqs)\nreqs = ['nose']\n",
+        "reqs = ['pytest']\nfor extra in ['mock']:\n    reqs = reqs + [extra]\n"
+        "setup(name='x', tests_require=reqs)\n",
+    ],
+)
+def test_setup_py_names_changed_after_binding_are_noted_not_guessed(setup_py: str) -> None:
+    found = detect({"setup.py": "from setuptools import setup\n" + setup_py})
+    assert "setup.py: tests_require is computed when setup.py runs; not read" in found.notes
+    assert found.fields["test_dependencies"] == ["pytest"]  # only the unpinned default
+    assert "pytest is not declared anywhere; added unpinned (pinning dates it)" in found.notes
+
+
+def test_setup_py_item_assignment_hides_extras_with_a_note() -> None:
+    found = detect(
+        {
+            "setup.py": "from setuptools import setup\nextras = {}\n"
+            "extras['tests'] = ['pytest', 'hypothesis']\nsetup(extras_require=extras)\n"
+        }
+    )
+    assert "extras" not in found.fields
+    assert "setup.py: extras_require is computed when setup.py runs; not read" in found.notes
+
+
+def test_setup_py_plain_rebinding_before_the_call_is_still_read() -> None:
+    found = detect(
+        {
+            "setup.py": "from setuptools import setup\nbase = ['pytest']\n"
+            "tests = base + ['mock']\nsetup(tests_require=tests)\n"
+        }
+    )
+    assert found.fields["test_dependencies"] == ["pytest", "mock"]

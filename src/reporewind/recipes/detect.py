@@ -11,10 +11,12 @@ Detectors read, in this order of precedence:
   ``[tool:pytest]``;
 * ``setup.py``: parsed with :mod:`ast` and **never executed**; only literal
   keyword arguments of the ``setup()`` call (or module-level names bound to
-  literals) are read, and anything computed at run time is reported in the
-  notes instead of guessed;
+  literals and never changed in place or rebound) are read, and anything
+  computed at run time is reported in the notes instead of guessed;
 * ``requirements*.txt`` and ``requirements/*.txt`` (runtime and test files;
-  docs, lint and typing files are skipped);
+  docs, lint and typing files are skipped, and when ``tox.ini`` names
+  requirements files, tox is the authority: files it uses only under a
+  factor such as ``min:`` are never installed);
 * ``tox.ini``: ``[testenv]`` deps, extras, commands and setenv.
 
 The result is a :class:`Detection`: the sparse recipe fields that had
@@ -120,6 +122,8 @@ class _Facts:
     extras_wanted: list[str] = field(default_factory=list)
     test_requirements: list[str] = field(default_factory=list)
     requirements_files: list[str] = field(default_factory=list)
+    tox_requirements: bool = False
+    factor_requirements: set[str] = field(default_factory=set)
     declared_names: set[str] = field(default_factory=set)
     pytest_evidence: list[str] = field(default_factory=list)
     unittest_evidence: list[str] = field(default_factory=list)
@@ -384,7 +388,7 @@ def _setup_py(scan: _Scan, facts: _Facts) -> None:
     if not setup_calls:
         scan.note("setup.py has no setup() call that could be read")
         return
-    names = _module_literals(module)
+    names = _module_literals(module, before=setup_calls[0].lineno)
     for keyword in setup_calls[0].keywords:
         if keyword.arg is None:
             scan.note("setup.py passes **kwargs to setup(); those values were not read")
@@ -445,8 +449,14 @@ def _requirements_candidates(files: Iterable[str]) -> list[str]:
 
 def _requirements_files(scan: _Scan, facts: _Facts) -> None:
     for path in _requirements_candidates(scan.files):
-        if path not in facts.requirements_files:
-            facts.requirements_files.append(path)
+        if path in facts.requirements_files:
+            continue
+        if path in facts.factor_requirements:
+            continue  # tox installs it only under a factor; already noted
+        if facts.tox_requirements and path != "requirements.txt":
+            scan.note(f"{path} not installed: tox.ini's [testenv] does not use it")
+            continue
+        facts.requirements_files.append(path)
     for path in facts.requirements_files:
         for line in _lines(scan.text(path) or ""):
             if not line.startswith("-") and (name := _requirement_name(line)):
@@ -459,6 +469,9 @@ def _requirements_files(scan: _Scan, facts: _Facts) -> None:
 def _tox_dep(scan: _Scan, facts: _Facts, line: str) -> None:
     if _TOX_FACTOR.match(line):
         scan.note(f"tox.ini: skipped factor-conditional dependency {line!r}")
+        rest = line.split(":", 1)[1].strip()
+        if rest.startswith("-r"):
+            facts.factor_requirements.add(rest[2:].strip())
         return
     if "{" in line:
         scan.note(f"tox.ini: skipped {line!r} (uses tox substitution)")
@@ -470,6 +483,7 @@ def _tox_dep(scan: _Scan, facts: _Facts, line: str) -> None:
         except InvalidPathError:
             scan.note(f"tox.ini: skipped requirements file {path!r} (outside the repository)")
             return
+        facts.tox_requirements = True
         if path not in scan.index:
             scan.note(f"tox.ini: requirements file {path} does not exist at this commit")
         elif path not in facts.requirements_files:

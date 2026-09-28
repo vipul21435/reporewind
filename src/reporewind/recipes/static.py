@@ -83,17 +83,74 @@ def literal(node: ast.expr, names: Mapping[str, object]) -> object:
         return UNKNOWN
 
 
-def module_literals(module: ast.Module) -> dict[str, object]:
+_MUTATING_METHODS: Final = frozenset(
+    {"append", "extend", "insert", "update", "setdefault", "pop", "remove", "clear", "add"}
+)
+
+
+def _mutated_names(module: ast.Module) -> set[str]:
+    """Names changed in place anywhere: ``+=``, ``x[k] = v``, ``x.append(...)``, ``del x[k]``."""
+    mutated: set[str] = set()
+    for node in ast.walk(module):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.AugAssign):
+            targets = [node.target]
+        elif isinstance(node, ast.Assign | ast.Delete):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _MUTATING_METHODS
+        ):
+            targets = [node.func.value]
+        for target in targets:
+            if isinstance(node, ast.AugAssign | ast.Call) and isinstance(target, ast.Name):
+                mutated.add(target.id)
+            while isinstance(target, ast.Subscript | ast.Attribute):
+                target = target.value
+                if isinstance(target, ast.Name):
+                    mutated.add(target.id)
+    return mutated
+
+
+def module_literals(module: ast.Module, *, before: int | None = None) -> dict[str, object]:
+    """Module-level names bound to literals, left out when the value is not certain.
+
+    A name is left out (so :func:`literal` returns ``UNKNOWN`` and callers
+    note it) when it is changed in place anywhere (``+=``, item assignment,
+    ``append``/``extend``/``update``...), bound anywhere other than a plain
+    top-level assignment (loops, ``with``, functions, conditionals) or, with
+    ``before`` (a line number such as the ``setup()`` call's), rebound at or
+    after that line.
+    """
+    mutated = _mutated_names(module)
+    top_level = {id(node) for node in module.body if isinstance(node, ast.Assign)}
+    unsure = set(mutated)
+    for node in ast.walk(module):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store | ast.Del):
+            parent_ok = any(
+                id(stmt) in top_level
+                and any(target is node for target in stmt.targets)
+                and (before is None or stmt.lineno < before)
+                for stmt in module.body
+                if isinstance(stmt, ast.Assign)
+            )
+            if not parent_ok:
+                unsure.add(node.id)
     names: dict[str, object] = {}
-    for node in module.body:
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            target = node.targets[0]
-            if isinstance(target, ast.Name):
-                value = literal(node.value, names)
+    for stmt in module.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            target = stmt.targets[0]
+            if isinstance(target, ast.Name) and (before is None or stmt.lineno < before):
+                value = literal(stmt.value, names)
                 if value is not UNKNOWN:
                     names[target.id] = value
                 else:
                     names.pop(target.id, None)
+    for name in unsure:
+        names.pop(name, None)
     return names
 
 

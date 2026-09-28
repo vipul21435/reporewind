@@ -183,7 +183,7 @@ def _setup_py(reader: _Reader) -> None:
     ]
     if not calls:
         return
-    names = module_literals(module)
+    names = module_literals(module, before=calls[0].lineno)
     for keyword in calls[0].keywords:
         if keyword.arg not in {"classifiers", "install_requires", "extras_require"}:
             continue
