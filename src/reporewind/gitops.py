@@ -365,6 +365,17 @@ class Git:
         out = self._text("ls-tree", "-r", "-z", "--name-only", "--full-tree", self.rev_parse(rev))
         return tuple(sorted(name for name in out.split("\x00") if name))
 
+    def symlinks(self, rev: str) -> dict[str, str]:
+        """Symbolic links in the tree of ``rev``: ``{path: link target}``."""
+        out = self._text("ls-tree", "-r", "-z", "--full-tree", self.rev_parse(rev))
+        links: dict[str, str] = {}
+        for entry in out.split("\x00"):
+            meta, _, path = entry.partition("\t")
+            fields = meta.split()
+            if len(fields) == 3 and fields[0] == "120000":
+                links[path] = self._text("cat-file", "blob", fields[2])
+        return links
+
     def tree_id(self, rev: str) -> str:
         """Object id of the tree that commit ``rev`` records."""
         sha = self.rev_parse(rev)

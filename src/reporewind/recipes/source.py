@@ -10,11 +10,15 @@ interface from a mapping, for callers that already hold the files.
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import Mapping
 from typing import Protocol
 
+from reporewind.errors import InvalidPathError
 from reporewind.gitops import Git
 from reporewind.models import check_repo_path
+
+MAX_LINK_HOPS = 8
 
 
 class TreeSource(Protocol):
@@ -42,6 +46,7 @@ class GitTreeSource:
         self._commit = git.rev_parse(rev)
         self._files: tuple[str, ...] | None = None
         self._index: frozenset[str] = frozenset()
+        self._links: dict[str, str] | None = None
 
     @property
     def commit(self) -> str:
@@ -54,11 +59,34 @@ class GitTreeSource:
         return self._files
 
     def read(self, path: str) -> bytes | None:
+        """Contents of ``path``; a symbolic link is followed to its target.
+
+        ``git cat-file`` on a link returns the target path, not the file,
+        so links are resolved inside the tree first. A link that leaves the
+        repository, dangles, or loops reads as ``None``.
+        """
         check_repo_path(path)
         self.files()
-        if path not in self._index:
+        target = self._follow(path)
+        if target is None:
             return None
-        return self.git.read_file(self._commit, path)
+        return self.git.read_file(self._commit, target)
+
+    def _follow(self, path: str) -> str | None:
+        if self._links is None:
+            self._links = self.git.symlinks(self._commit)
+        hops = 0
+        while path in self._links:
+            hops += 1
+            target = self._links[path]
+            if hops > MAX_LINK_HOPS or target.startswith("/"):
+                return None
+            joined = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+            try:
+                path = check_repo_path(joined)
+            except InvalidPathError:
+                return None
+        return path if path in self._index else None
 
 
 class MemoryTreeSource:

@@ -113,9 +113,15 @@ are included.
   requirements (read statically from `pyproject.toml`, Poetry tables,
   `setup.cfg` or `setup.py` via `ast`) plus its recipe extras, the recipe's
   test dependencies and its requirements files with their `-r`/`-c`
-  includes. Lines that install the project itself (`-e .`) are dropped, so
-  the host never runs the project's build backend. uv runs behind the
-  `CommandRunner` protocol, so unit tests use a scripted fake.
+  includes. Lines that install the project itself (`-e .`, `-e.`,
+  `.[tests]`, `-e ".[dev]"`) are dropped, so the host never runs the
+  project's build backend; the extras they name are locked from the
+  commit's metadata instead. Extras that name the project itself
+  (`tests = ["attrs[tests-no-zope]"]`) are expanded from the same commit, not
+  resolved from the index, and Poetry dependencies marked `optional = true`
+  are locked only through their extra. Symlinked requirements files are
+  read through their link. uv runs behind the `CommandRunner` protocol, so
+  unit tests use a scripted fake.
 - **Pin the base image by digest**: `python:X.Y-slim` is resolved to its
   multi-platform index digest with `docker buildx imagetools inspect`; if
   that fails, or `REPOREWIND_OFFLINE=1` / `--offline` is set, the digest
