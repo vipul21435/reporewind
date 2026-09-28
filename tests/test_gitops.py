@@ -54,10 +54,18 @@ def test_hermetic_env_scrubs_redirects_and_injected_config() -> None:
     env = hermetic_env(base, extra={"GIT_AUTHOR_NAME": "x"})
     assert env["PATH"] == "/bin"
     assert env["HOME"] == "/home/u"
-    for key in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0"):
+    for key in ("GIT_DIR", "GIT_INDEX_FILE"):
         assert key not in env
+    assert "diff.noprefix" not in env.values()
     assert env["GIT_CONFIG_GLOBAL"] == os.devnull
     assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_ATTR_NOSYSTEM"] == "1"
+    # Only RepoRewind's own pinned keys are injected through GIT_CONFIG_*.
+    pinned = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert pinned == {"core.attributesFile": os.devnull, "core.excludesFile": os.devnull}
     assert env["GIT_TERMINAL_PROMPT"] == "0"
     assert env["GIT_ALLOW_PROTOCOL"] == ALLOWED_PROTOCOLS
     assert env["GIT_AUTHOR_NAME"] == "x"
@@ -93,6 +101,36 @@ def test_user_config_and_inherited_git_env_do_not_leak(
     git = Git(repo.path)
     assert git.rev_parse("HEAD") == shas[-1]
     assert git.diff(shas[0], shas[1]).startswith("diff --git a/src/calc.py b/src/calc.py\n")
+
+
+def test_per_user_attributes_and_ignore_files_do_not_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # git reads $XDG_CONFIG_HOME/git/{attributes,ignore} (else ~/.config/git/...)
+    # even when no global config file is loaded; both must be ignored.
+    files: dict[str, str | bytes | None] = {"d.txt": "a\nb\n", "m.py": "x = 1\n", ".env": "S=1\n"}
+    monkeypatch.setenv("HOME", str(tmp_path / "clean-home"))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    control = RepoFactory(tmp_path / "control").create(files=files)
+
+    user_git = tmp_path / "xdg" / "git"
+    user_git.mkdir(parents=True)
+    (user_git / "attributes").write_text("*.txt -diff\n*.py text eol=crlf\n")
+    (user_git / "ignore").write_text(".env\n*.log\n")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    repo = RepoFactory(tmp_path / "dirty").create(files=files)
+    base = repo.head
+    fix = repo.commit("fix", {"d.txt": "a\nc\n"})
+
+    assert base == control.head  # fixture SHAs do not depend on the machine
+    assert repo.git.list_files(base) == (".env", "d.txt", "m.py")
+    patch = repo.git.diff(base, fix)
+    assert "GIT binary patch" not in patch
+    assert "-b\n+c\n" in patch
+    with repo.git.worktree(base, tmp_path / "wt") as wt:
+        assert (wt.repo_dir / "m.py").read_bytes() == b"x = 1\n"
+        (wt.repo_dir / "run.log").write_text("untracked\n")
+        assert wt.changed_paths() == ("run.log",)
 
 
 def test_commands_get_repo_cwd_hermetic_env_and_timeout(tmp_path: Path) -> None:

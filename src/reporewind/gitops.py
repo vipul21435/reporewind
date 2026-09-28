@@ -6,8 +6,11 @@ Design rules, each of which exists because the opposite broke something:
   remotes and URLs that start with ``-`` are rejected before git sees them, and
   ``--`` / ``--end-of-options`` separate options from operands.
 * **Hermetic.** The user's global and system git config are ignored, as are
-  inherited ``GIT_DIR``-style variables (set by hooks) and config injected via
-  the environment, so a diff or a SHA never depends on the machine it ran on.
+  the per-user and system ``gitattributes`` and the per-user excludes file
+  (``~/.config/git/attributes`` and ``~/.config/git/ignore``, which git reads
+  even without a global config), inherited ``GIT_DIR``-style variables (set by
+  hooks) and config injected via the environment, so a diff, a checkout or a
+  SHA never depends on the machine it ran on.
   ``GIT_CEILING_DIRECTORIES`` stops git from walking up into an enclosing
   repository when the target directory is not one itself, and local
   ``git replace`` objects are ignored (``GIT_NO_REPLACE_OBJECTS``).
@@ -67,6 +70,14 @@ _SCRUBBED_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
 _UNSAFE_REV = re.compile(r"[\s\x00-\x1f\x7f]")
 # NUL-separated so a subject line can contain any printable text.
 _COMMIT_FORMAT = "%H%x00%aI%x00%cI%x00%s"
+# Config that must hold even though no global config file is read: git falls
+# back to $XDG_CONFIG_HOME/git/{attributes,ignore} (or ~/.config/git/...)
+# when these keys are unset, and those files change diffs (``-diff``,
+# ``diff=<driver>``), checkouts (``eol=crlf``) and what ``git add`` stages.
+_PINNED_CONFIG = (
+    ("core.attributesFile", os.devnull),
+    ("core.excludesFile", os.devnull),
+)
 
 
 def hermetic_env(
@@ -87,14 +98,19 @@ def hermetic_env(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_ATTR_NOSYSTEM": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_ALLOW_PROTOCOL": ALLOWED_PROTOCOLS,
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_LITERAL_PATHSPECS": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "LC_ALL": "C",
+            "GIT_CONFIG_COUNT": str(len(_PINNED_CONFIG)),
         }
     )
+    for index, (key, value) in enumerate(_PINNED_CONFIG):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
     if extra:
         env.update(extra)
     return env
