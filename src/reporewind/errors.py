@@ -16,6 +16,7 @@ codes without string matching and callers can catch a whole stage at once::
     |       +-- RevisionNotFoundError  revision does not name a commit
     |       +-- PatchApplyError        patch does not apply to the work tree
     +-- ResolveError               10  commit resolution / diff splitting
+    |   +-- PatchParseError            a diff that cannot be split into file patches
     +-- RecipeError                11  build recipe detection or validation
     +-- PinError                   12  Python / dependency / base image pinning
     +-- BuildError                 13  Docker image build
@@ -142,6 +143,10 @@ class ResolveError(RepoRewindError):
     """Commit resolution or diff splitting failed (root commit, no test changes, ...)."""
 
     exit_code: ClassVar[int] = 10
+
+
+class PatchParseError(ResolveError):
+    """A diff could not be split into per-file patches (malformed or not re-applicable)."""
 
 
 class RecipeError(RepoRewindError):
