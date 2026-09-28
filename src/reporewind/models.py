@@ -25,7 +25,7 @@ from pydantic import (
     model_validator,
 )
 
-from reporewind.errors import InvalidRepoRefError
+from reporewind.errors import InvalidPathError, InvalidRepoRefError
 
 DEFAULT_HOST = "github.com"
 
@@ -56,22 +56,27 @@ Sha = Annotated[
 """A full git object id; input is trimmed and lowercased before validation."""
 
 
-def _check_repo_path(value: str) -> str:
+def check_repo_path(value: str) -> str:
+    """Return ``value`` if it is a safe repository-relative POSIX path.
+
+    Raises :class:`InvalidPathError` (a ``ValueError``) for empty, absolute or
+    NUL-containing paths, ``.``/``..``/empty segments and anything under ``.git``.
+    """
     if not value:
-        raise ValueError("path must not be empty")
+        raise InvalidPathError(value, "path is empty")
     if "\x00" in value:
-        raise ValueError("path must not contain NUL")
+        raise InvalidPathError(value, "path contains NUL")
     if value.startswith("/"):
-        raise ValueError(f"path {value!r} must be relative to the repository root")
+        raise InvalidPathError(value, "path must be relative to the repository root")
     segments = value.split("/")
     if any(seg in {"", ".", ".."} for seg in segments):
-        raise ValueError(f"path {value!r} must not contain empty, '.' or '..' segments")
+        raise InvalidPathError(value, "path must not contain empty, '.' or '..' segments")
     if any(seg.lower() == ".git" for seg in segments):
-        raise ValueError(f"path {value!r} must not point inside a .git directory")
+        raise InvalidPathError(value, "path must not point inside a .git directory")
     return value
 
 
-RepoPath = Annotated[str, AfterValidator(_check_repo_path)]
+RepoPath = Annotated[str, AfterValidator(check_repo_path)]
 """A normalized POSIX path relative to the repository root that cannot escape it."""
 
 
@@ -338,6 +343,7 @@ __all__ = [
     "RepoRef",
     "ResolvedFix",
     "Sha",
+    "check_repo_path",
     "is_full_sha",
     "join_patches",
     "split_repo_ref",

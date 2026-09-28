@@ -8,6 +8,7 @@ codes without string matching and callers can catch a whole stage at once::
     +-- ConfigError                 2  bad user input (also a ValueError)
     |   +-- InvalidRepoRefError        unparseable repository reference
     |   +-- InvalidRevisionError       revision string that is unsafe to pass to git
+    |   +-- InvalidPathError           path that escapes the repository or touches .git
     +-- ToolNotFoundError           3  git / uv / docker missing from PATH
     +-- CommandError                4  an external command failed
     |   +-- CommandTimeoutError        ... or ran past its timeout
@@ -61,6 +62,15 @@ class InvalidRevisionError(ConfigError):
         super().__init__(f"invalid revision {value!r}: {reason}")
 
 
+class InvalidPathError(ConfigError):
+    """A repository path that is absolute, escapes the root or points into ``.git``."""
+
+    def __init__(self, value: str, reason: str) -> None:
+        self.value = value
+        self.reason = reason
+        super().__init__(f"invalid repository path {value!r}: {reason}")
+
+
 class ToolNotFoundError(RepoRewindError):
     """A required executable is not installed or not on ``PATH``."""
 
@@ -94,7 +104,8 @@ class CommandError(RepoRewindError):
         self.stdout = stdout
         self.stderr = stderr
         headline = message or f"command exited with status {returncode}"
-        detail = stderr_tail(stderr)
+        # Some tools (git commit, for one) explain failures on stdout only.
+        detail = stderr_tail(stderr) or stderr_tail(stdout)
         text = f"{headline}: {shlex.join(self.argv)}"
         super().__init__(f"{text}\n{detail}" if detail else text)
 

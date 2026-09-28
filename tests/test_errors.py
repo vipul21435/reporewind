@@ -100,3 +100,8 @@ def test_revision_not_found_is_a_git_error() -> None:
 )
 def test_stderr_tail_keeps_last_non_blank_lines(stderr: str, lines: int, expected: str) -> None:
     assert stderr_tail(stderr, lines) == expected
+
+
+def test_command_error_falls_back_to_stdout_when_stderr_is_empty() -> None:
+    err = CommandError(["git", "commit"], 1, "On branch main\nnothing to commit\n", "")
+    assert str(err).endswith("\nOn branch main\nnothing to commit")
