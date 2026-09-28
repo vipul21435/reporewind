@@ -70,11 +70,20 @@ def poetry_constraint(value: str) -> str:
         raise ValueError(f"cannot convert constraint {value!r}: {exc}") from None
 
 
+def _python_marker(operator: str, version: str) -> str:
+    # python_version is only "X.Y", so a bound with a patch level (">=3.6.2",
+    # "!=3.9.0") must compare against python_full_version, as Poetry does;
+    # otherwise ">=3.6.2" rejects 3.6.15 and "!=3.9.0" rejects every 3.9.x.
+    release = version.removesuffix(".*").split(".")
+    variable = "python_full_version" if len(release) > 2 else "python_version"
+    return f'{variable} {operator} "{version}"'
+
+
 def python_markers(constraint: str) -> str:
     """Environment markers equivalent to a Poetry ``python = "..."`` restriction."""
     specifiers = SpecifierSet(poetry_constraint(constraint))
     return " and ".join(
-        f'python_version {spec.operator} "{spec.version}"' for spec in sorted(specifiers, key=str)
+        _python_marker(spec.operator, spec.version) for spec in sorted(specifiers, key=str)
     )
 
 

@@ -86,7 +86,12 @@ class RecipeFile(BaseModel):
 
     def recipe(self) -> Recipe:
         """The effective recipe; raises :class:`RecipeError` if it is invalid."""
-        merged = merge_patch(self.detected.recipe, self.overrides)
+        detected = dict(self.detected.recipe)
+        if "test_framework" in self.overrides and "test_command" not in self.overrides:
+            # A detected command belongs to the detected runner; a framework
+            # override brings that framework's default command instead.
+            detected.pop("test_command", None)
+        merged = merge_patch(detected, self.overrides)
         try:
             return Recipe.model_validate(merged)
         except ValidationError as exc:
@@ -179,6 +184,15 @@ def dump_recipe_file(recipe_file: RecipeFile) -> str:
     return HEADER + body
 
 
+def _same_repo(a: RepoRef, b: RepoRef) -> bool:
+    """GitHub-style hosts treat owner and name case-blind, like ``recipe_stem``."""
+    return (a.host.lower(), a.owner.lower(), a.name.lower()) == (
+        b.host.lower(),
+        b.owner.lower(),
+        b.name.lower(),
+    )
+
+
 def load_recipe_file(path: Path, *, expected: RepoRef | None = None) -> RecipeFile:
     """Read, validate and check the name of the recipe file at ``path``."""
     try:
@@ -189,7 +203,7 @@ def load_recipe_file(path: Path, *, expected: RepoRef | None = None) -> RecipeFi
     stem = recipe_file.repo.recipe_stem
     if path.name != f"{stem}.yaml":
         raise RecipeError(f"{path}: the recipe for {recipe_file.repo} must be named {stem}.yaml")
-    if expected is not None and recipe_file.repo != expected:
+    if expected is not None and not _same_repo(recipe_file.repo, expected):
         raise RecipeError(f"{path} is the recipe for {recipe_file.repo}, not {expected}")
     return recipe_file
 

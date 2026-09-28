@@ -53,3 +53,18 @@ def test_poetry_requirements() -> None:
         poetry_requirement("lib", {"git": "https://example.invalid/lib.git"})
     with pytest.raises(ValueError, match="multiple-constraint"):
         poetry_requirement("lib", [{"version": "1"}, {"version": "2"}])
+
+
+def test_patch_level_python_bounds_use_the_full_version() -> None:
+    from packaging.markers import Marker
+
+    typed_ast = poetry_requirement("typed-ast", {"version": "^1.4", "python": ">=3.6.2,<3.8"})
+    marker = Marker(typed_ast.split(";", 1)[1])
+    assert marker.evaluate({"python_version": "3.6", "python_full_version": "3.6.15"})
+    assert not marker.evaluate({"python_version": "3.6", "python_full_version": "3.6.1"})
+    assert not marker.evaluate({"python_version": "3.8", "python_full_version": "3.8.0"})
+    not_390 = Marker(poetry_requirement("foo", {"version": "*", "python": "!=3.9.0"}).split(";")[1])
+    assert not_390.evaluate({"python_version": "3.9", "python_full_version": "3.9.7"})
+    assert not not_390.evaluate({"python_version": "3.9", "python_full_version": "3.9.0"})
+    assert python_markers("~3.6.2") == ('python_version < "3.7" and python_full_version >= "3.6.2"')
+    assert python_markers("3.9.*") == 'python_version == "3.9.*"'

@@ -192,3 +192,44 @@ def test_failed_save_leaves_no_temporary_file(
     with pytest.raises(OSError, match="disk full"):
         store.save(recipe_file())
     assert list(tmp_path.iterdir()) == []
+
+
+def test_lookup_is_case_blind_like_the_file_name(tmp_path: Path) -> None:
+    store = RecipeStore(tmp_path / "recipes")
+    store.save(recipe_file())
+    assert store.load(RepoRef.parse("example/calc")).repo == REPO
+    assert store.load(RepoRef.parse("EXAMPLE/CALC")).repo == REPO
+    merged = store.merge_detection(RepoRef.parse("example/CALC"), detection())
+    assert merged.repo == REPO
+
+
+def test_framework_override_drops_a_detected_command_of_the_other_runner() -> None:
+    found = detect_recipe(
+        MemoryTreeSource(
+            {
+                "setup.py": "from setuptools import setup\nsetup(name='x', test_suite='tests')\n",
+                "tests/__init__.py": "",
+                "tests/test_a.py": (
+                    "import unittest\nclass T(unittest.TestCase):\n    def test_x(self): pass\n"
+                ),
+            }
+        )
+    )
+    assert found.fields["test_command"][:3] == ["python", "-m", "unittest"]
+    recipe = RecipeFile(
+        repo=REPO,
+        detected=DetectedBlock.from_detection(found),
+        overrides={"test_framework": "pytest", "test_dependencies": ["pytest"]},
+    ).recipe()
+    assert recipe.test_framework == "pytest"
+    assert recipe.test_command == ("python", "-m", "pytest", "-rA")
+
+
+def test_mismatched_framework_and_command_is_rejected() -> None:
+    bad = RecipeFile(
+        repo=REPO,
+        detected=DetectedBlock.from_detection(detection(test_framework="unittest")),
+        overrides={"test_command": ["pytest", "-x"]},
+    )
+    with pytest.raises(RecipeError, match="test_command runs pytest but test_framework is"):
+        bad.recipe()

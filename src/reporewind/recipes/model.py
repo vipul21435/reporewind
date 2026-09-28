@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import itertools
 import json
 import re
 from collections.abc import Mapping
@@ -66,6 +67,23 @@ DEFAULT_TEST_COMMANDS: Mapping[Framework, tuple[str, ...]] = {
     Framework.PYTEST: ("python", "-m", "pytest", "-rA"),
     Framework.UNITTEST: ("python", "-m", "unittest", "discover", "-v"),
 }
+
+
+def command_runner(command: tuple[str, ...] | list[str]) -> Framework | None:
+    """The framework ``command`` visibly runs (``pytest``, ``-m unittest``), if any."""
+    if not command:
+        return None
+    program = command[0].rsplit("/", 1)[-1]
+    if program in {"pytest", "py.test"}:
+        return Framework.PYTEST
+    for flag, module in itertools.pairwise(command):
+        if flag == "-m":
+            if module in {"pytest", "py.test"}:
+                return Framework.PYTEST
+            if module == "unittest":
+                return Framework.UNITTEST
+            return None
+    return None
 
 
 def _unique(values: tuple[str, ...], what: str) -> tuple[str, ...]:
@@ -149,6 +167,16 @@ class Recipe(BaseModel):
                 return data  # the field validator reports the bad framework
             return {**data, "test_command": default}
         return data
+
+    @model_validator(mode="after")
+    def _check_runner(self) -> Self:
+        runner = command_runner(self.test_command)
+        if runner is not None and runner is not self.test_framework:
+            raise ValueError(
+                f"test_command runs {runner.value} but test_framework is "
+                f"{self.test_framework.value}; set test_command to null to use the default"
+            )
+        return self
 
     @field_validator("python")
     @classmethod
@@ -248,6 +276,7 @@ __all__ = [
     "InstallMode",
     "Recipe",
     "canonical_json",
+    "command_runner",
     "merge_patch",
     "normalize_extra",
     "normalize_requirement",

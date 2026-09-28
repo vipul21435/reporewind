@@ -12,6 +12,7 @@ from reporewind.recipes import (
     merge_patch,
     recipe_hash,
 )
+from reporewind.recipes.model import command_runner
 
 
 def test_defaults_fill_the_framework_test_command() -> None:
@@ -115,3 +116,26 @@ def test_canonical_json_shape() -> None:
     assert payload["recipe"]["python"] == ">=3.8"
     assert payload["recipe"]["test_command"] == ["python", "-m", "pytest", "-rA"]
     assert " " not in canonical_json(Recipe()).replace("python -m", "")
+
+
+@pytest.mark.parametrize(
+    ("command", "runner"),
+    [
+        (["pytest", "-x"], Framework.PYTEST),
+        (["/usr/bin/py.test"], Framework.PYTEST),
+        (["python", "-W", "error", "-m", "pytest"], Framework.PYTEST),
+        (["python", "-m", "unittest", "discover"], Framework.UNITTEST),
+        (["python", "-m", "tox"], None),
+        (["make", "test"], None),
+        ([], None),
+    ],
+)
+def test_command_runner(command: list[str], runner: Framework | None) -> None:
+    assert command_runner(command) is runner
+
+
+def test_recipe_rejects_a_command_for_the_other_framework() -> None:
+    with pytest.raises(ValidationError, match="test_command runs unittest"):
+        Recipe(test_framework=Framework.PYTEST, test_command=("python", "-m", "unittest"))
+    custom = Recipe(test_framework=Framework.UNITTEST, test_command=("make", "check"))
+    assert custom.test_command == ("make", "check")
