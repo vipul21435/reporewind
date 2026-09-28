@@ -60,6 +60,52 @@ commit, then exports the result as a schema-validated task bundle.
     exposes it as `repo_factory`. Its initial commit SHA is pinned in a test
     to catch any machine-dependent drift.
 
+- **Slice 2 decisions (resolver, diff splitter, PR lookup).**
+  - The split is proven in a *scratch index* (`git apply --cached` with a
+    temporary `GIT_INDEX_FILE`), not a worktree: no checkout, nothing
+    written to the user's clone except objects, and it works in the bare
+    cache. Source and test patches must each apply to the base on their
+    own, and base + source + test must equal the fix commit's tree id, which
+    proves the split lost and duplicated nothing.
+  - A patch is a test change only if *every* path it touches is a test
+    path, so a rename across the test/source boundary lands in the source
+    patch and the test patch never edits library code. Default test dirs
+    are `tests` and `test` only (`testing/` is often library code, e.g. a
+    package's public test helpers); `tests.py` (Django style) joins the
+    spec's `test_*.py`, `*_test.py` and `conftest.py`.
+  - The diff parser takes paths from rename/copy headers, then `---`/`+++`,
+    then the same-name `diff --git a/P b/P` form; it rejects `Binary files
+    differ` stubs (not re-applicable), unknown header lines and unsafe
+    paths, and merges git's delete+add pair for a type change into one
+    patch so each path appears once.
+  - `commit_info` reads parents from the raw commit object: `%P` reports no
+    parents for a shallow-fetch boundary, which made the base look like a
+    root commit and made the JSON depend on fetch depth.
+    `GIT_NO_REPLACE_OBJECTS=1` joins the hermetic environment.
+  - The repo cache is one bare repository per hosted repository under
+    `$REPOREWIND_HOME/repos/<host>/<owner>__<repo>.git`, filled by
+    `fetch --depth 2 <sha>` and pinned under `refs/reporewind/commits/`.
+    A commit that is only a shallow boundary is fetched again (deepened).
+    There is no cross-process lock yet; the build lock arrives in slice 5
+    and concurrent fetches into one cache rely on git's own locking.
+  - PR shapes: two parents -> mainline 1; one parent -> the landed commit;
+    a multi-commit rebase merge (landed commit has the same message and
+    author date as the PR's last commit) is rejected, since no single
+    commit is the whole fix. PRs above GitHub's 250-commit listing limit
+    are rejected for the same check. The API's own parent list picks the
+    base, and git re-derives it from the fetched commit.
+  - `pydantic`'s `model_dump_json` rejects the lone surrogates that carry
+    non-UTF-8 diff bytes, so `ResolvedFix` JSON always goes through
+    `dump_resolved_fix` / `load_resolved_fix` (ASCII JSON with `\udcXX`
+    escapes). The bundle writer in slice 7 must use them too.
+  - Offline GitHub tests replay responses recorded from the live API
+    (pallets/markupsafe#477, a merge commit; python-attrs/attrs#1606, a
+    squash of two commits), trimmed by `tests/fixtures/github/record.sh`;
+    rarer shapes and error statuses are synthetic variants built in the
+    test. `reporewind.cli.github_client` is the seam tests patch.
+  - `reporewind.testing.make_bugfix` (pinned SHAs) is the shared bug-fix
+    repository for the verify slice: its new test fails without the fix.
+
 ## Target layout
 
 ```
@@ -87,7 +133,7 @@ tests, green lint (ruff), strict typecheck (mypy) and a green suite.
 
 1. [x] **Domain models, errors and git plumbing** (done 2026-09-29) - Add pydantic v2 domain models (`RepoRef` parsed from HTTPS/SSH/`owner/repo` forms, `CommitInfo`, `FilePatch`, `ResolvedFix`), a typed error hierarchy, and a no-shell `Git` wrapper (clone, fetch a single SHA, rev-parse, parents, commit date, diff, apply --check, apply, detached checkout into a work dir). Ship a pytest `repo_factory` fixture that builds throwaway git repos in tmp dirs with fixed author/committer dates, so every later slice tests offline.
 
-2. [ ] **Commit resolver and diff splitter** - From a repo URL plus fix SHA, resolve the parent commit (reject root commits; require an explicit mainline for merge commits), compute the fix diff and split it per file into a source patch and a test patch using configurable path rules (`tests/`, `test_*.py`, `*_test.py`, `conftest.py`), handling adds, deletes, renames and binary files, and prove both patches apply cleanly to the parent. Resolve a GitHub PR number to its fix/base commits through the REST API (httpx with an injectable transport, recorded JSON fixtures, optional `GITHUB_TOKEN`). Expose `reporewind resolve` that prints or writes the `ResolvedFix` JSON.
+2. [x] **Commit resolver and diff splitter** (done 2026-09-29) - From a repo URL plus fix SHA, resolve the parent commit (reject root commits; require an explicit mainline for merge commits), compute the fix diff and split it per file into a source patch and a test patch using configurable path rules (`tests/`, `test_*.py`, `*_test.py`, `conftest.py`), handling adds, deletes, renames and binary files, and prove both patches apply cleanly to the parent. Resolve a GitHub PR number to its fix/base commits through the REST API (httpx with an injectable transport, recorded JSON fixtures, optional `GITHUB_TOKEN`). Expose `reporewind resolve` that prints or writes the `ResolvedFix` JSON.
 
 3. [ ] **Build recipes: schema, detection and store** - Define a pydantic `Recipe` (Python constraint, install mode, extras, requirements files, system packages, pre-install steps, test command, test framework, env) and detectors that read `pyproject.toml` (PEP 621, setuptools, poetry, hatch, flit), `setup.py` (parsed with `ast`, never executed), `setup.cfg`, `requirements*.txt` and `tox.ini` at the parent commit via `git show`. Store recipes as `recipes/<owner>__<repo>.yaml` where human overrides deep-merge over detected values and the result is validated; add a stable recipe hash (sha256 of canonical JSON) and `reporewind recipe detect|show|validate`.
 
