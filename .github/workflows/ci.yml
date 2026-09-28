@@ -54,3 +54,16 @@ jobs:
           name: coverage-xml
           path: coverage.xml
           if-no-files-found: ignore
+
+  docker:
+    name: docker image and demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the CLI image
+        run: docker build -t reporewind:ci .
+
+      - name: Run the offline demo inside the image
+        run: docker run --rm --entrypoint sh reporewind:ci /app/demo/run.sh

@@ -1,10 +1,11 @@
 .DEFAULT_GOAL := help
 UV ?= uv
+IMAGE ?= reporewind:local
 
-.PHONY: help install lint format typecheck test cov e2e demo sample clean
+.PHONY: help install lint format typecheck test cov e2e demo sample docker-build docker-demo clean
 
 help: ## List available targets
-	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-10s %s\n", $$1, $$2}'
+	@grep -E '^[a-z0-9-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-13s %s\n", $$1, $$2}'
 
 install: ## Create the locked virtualenv and install pre-commit hooks
 	$(UV) sync --locked
@@ -35,6 +36,13 @@ demo: ## Offline end-to-end demo on the bundled sample repository
 
 sample: ## Regenerate demo/slugkit.fi from demo/make_sample.py
 	$(UV) run python demo/make_sample.py
+
+docker-build: ## Build the CLI image (digest-pinned base, non-root) and prune its dangling layers
+	docker build -t $(IMAGE) .
+	docker image prune --force --filter label=project=reporewind
+
+docker-demo: docker-build ## Run the offline demo inside the image
+	docker run --rm --entrypoint sh $(IMAGE) /app/demo/run.sh
 
 clean: ## Remove caches and coverage output
 	rm -rf .pytest_cache .mypy_cache .ruff_cache .coverage coverage.xml htmlcov
