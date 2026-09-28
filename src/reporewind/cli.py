@@ -18,16 +18,27 @@ import yaml
 from pydantic import ValidationError
 
 from reporewind import __version__
-from reporewind.errors import ConfigError, RecipeError, RepoRewindError
+from reporewind.build import (
+    BuildCache,
+    DockerBuilder,
+    ensure_image,
+    environment_key,
+    export_source,
+    image_tag,
+    render_dockerfile,
+)
+from reporewind.errors import BuildError, ConfigError, RecipeError, RepoRewindError
 from reporewind.gitops import Git
 from reporewind.models import RepoRef
 from reporewind.pinning import (
     DEFAULT_PLATFORM,
+    PIN_FILE,
     PinOptions,
     PinResult,
     dump_pin_result,
     format_timestamp,
     is_offline,
+    load_pin_result,
     pin_commit,
     write_pin,
 )
@@ -441,6 +452,14 @@ def _pin_recipe(
     return detection.recipe(), (note,)
 
 
+def _state_dir(cache_dir: Path | None) -> Path:
+    return cache_dir if cache_dir is not None else home_dir()
+
+
+def _default_pin_dir(ref: RepoRef, target: str, cache_dir: Path | None) -> Path:
+    return _state_dir(cache_dir) / "pins" / ref.host / ref.recipe_stem / target
+
+
 def _pin_summary(result: PinResult, where: str, lock_path: Path, pin_path: Path) -> str:
     python, image = result.python, result.base_image
     lines = [
@@ -551,8 +570,7 @@ def pin_cmd(
             notes=notes,
         )
         if output_dir is None:
-            root = cache_dir if cache_dir is not None else home_dir()
-            output_dir = root / "pins" / ref.host / ref.recipe_stem / target
+            output_dir = _default_pin_dir(ref, target, cache_dir)
         lock_path, pin_path = write_pin(result, lock_text, output_dir)
         typer.echo(dump_pin_result(result), nl=False)
         if quiet:
@@ -562,3 +580,106 @@ def pin_cmd(
             number = commit.parents.index(target) + 1
             where += f" (parent {number} of {len(commit.parents)} of {commit.sha[:12]})"
         typer.echo(_pin_summary(result, where, lock_path, pin_path), err=True)
+
+
+@app.command("build")
+def build_cmd(
+    repo: Annotated[str, typer.Argument(help="Repository: owner/repo or a clone URL.")],
+    rev: Annotated[
+        str,
+        typer.Argument(help="Fix commit; its parent is built, as `reporewind pin` pinned it."),
+    ],
+    at_rev: Annotated[
+        bool, typer.Option("--at-rev", help="Build REV itself, not its parent.")
+    ] = False,
+    mainline: Annotated[
+        int | None,
+        typer.Option("--mainline", "-m", min=1, help="For a merge commit, the parent to build."),
+    ] = None,
+    repo_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--repo-dir",
+            file_okay=False,
+            help="Read commits from this existing local clone instead of the cache.",
+        ),
+    ] = None,
+    source: Annotated[
+        str | None,
+        typer.Option(help="Fetch from this URL or path instead of the repository's clone URL."),
+    ] = None,
+    cache_dir: Annotated[
+        Path | None,
+        typer.Option(
+            help="State directory for repos, pins and the build cache [default: $REPOREWIND_HOME]."
+        ),
+    ] = None,
+    recipes_dir: RecipesDirOption = DEFAULT_RECIPES_DIR,
+    pin_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--pin-dir",
+            file_okay=False,
+            help="Directory with pin.json and requirements.lock"
+            " [default: $REPOREWIND_HOME/pins/<host>/<owner>__<repo>/<sha>].",
+        ),
+    ] = None,
+    lock_timeout: Annotated[
+        float,
+        typer.Option(min=0, help="Seconds to wait for another process building the same image."),
+    ] = 1800.0,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the Dockerfile and image tag; do not call docker."),
+    ] = False,
+) -> None:
+    """Render the Dockerfile for the pinned commit and build its image once."""
+    with _exit_on_error():
+        ref = RepoRef.parse(repo)
+        if at_rev and mainline is not None:
+            raise ConfigError("--mainline picks a parent; it cannot be used with --at-rev")
+        git = _open_repository(ref, rev, repo_dir=repo_dir, source=source, cache_dir=cache_dir)
+        commit = git.commit_info(rev)
+        target = commit.sha if at_rev else select_base(commit, mainline)
+        pins = pin_dir if pin_dir is not None else _default_pin_dir(ref, target, cache_dir)
+        if not (pins / PIN_FILE).is_file():
+            raise BuildError(f"no {PIN_FILE} in {pins}; run `reporewind pin` first")
+        pin = load_pin_result(pins / PIN_FILE)
+        if pin.commit != target:
+            raise BuildError(f"{pins / PIN_FILE} pins {pin.commit[:12]}, not {target[:12]}")
+        try:
+            lock_text = (pins / pin.lock_file).read_text("utf-8", "surrogateescape")
+        except OSError as exc:
+            raise BuildError(f"cannot read the lock file: {exc}") from None
+        recipe, _ = _pin_recipe(RecipeStore(recipes_dir), ref, git, target)
+        dockerfile = render_dockerfile(recipe, pin, lock_text)
+        cache = BuildCache(_state_dir(cache_dir) / "build", lock_timeout=lock_timeout)
+        key = environment_key(pin, lock_text)
+        if dry_run:
+            typer.echo(dockerfile, nl=False)
+            entry = cache.get(key)
+            state = f"indexed as {entry.image_id}" if entry else "not built yet"
+            lines = [
+                f"dry run: {ref} at {target[:12]}",
+                f"  key      {key}",
+                f"  tag      {image_tag(ref, key)} ({state})",
+                f"  context  Dockerfile, {pin.lock_file}, src/ (git archive of {target[:12]})",
+                f"  run      docker run --rm --network none {image_tag(ref, key)}",
+            ]
+            typer.echo("\n".join(lines), err=True)
+            return
+        outcome = ensure_image(
+            pin,
+            dockerfile,
+            lock_text,
+            builder=DockerBuilder(command_runner()),
+            cache=cache,
+            write_source=lambda dest: export_source(git, target, dest),
+        )
+        payload = {
+            "key": outcome.key,
+            "tag": outcome.tag,
+            "image_id": outcome.image_id,
+            "status": outcome.status,
+        }
+        typer.echo(json.dumps(payload, indent=2))

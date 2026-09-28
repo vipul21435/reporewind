@@ -53,7 +53,9 @@ def _env_value(value: str) -> str:
 
 
 def lock_sha256(lock_text: str) -> str:
-    return hashlib.sha256(lock_text.encode("utf-8")).hexdigest()
+    """``sha256:<hex>`` of the lock text, as :class:`PinResult` records it."""
+    digest = hashlib.sha256(lock_text.encode("utf-8", "surrogateescape")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def check_inputs(recipe: Recipe, pin: PinResult, lock_text: str) -> None:

@@ -36,7 +36,7 @@ def pin_for(recipe: Recipe, lock: str = LOCK, *, digest: str = DIGEST) -> PinRes
         base_image=BaseImage(tag="python:3.8-slim", digest=digest, source="fallback"),
         exclude_newer=when,
         platform="x86_64-unknown-linux-gnu",
-        lock_sha256=hashlib.sha256(lock.encode()).hexdigest(),
+        lock_sha256="sha256:" + hashlib.sha256(lock.encode()).hexdigest(),
         packages=tuple(line.split(" ")[0] for line in lock.splitlines() if "==" in line),
         requirements=("pytest",),
         requirements_files=recipe.requirements_files,
