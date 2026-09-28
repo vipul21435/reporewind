@@ -21,11 +21,18 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from reporewind.errors import ConfigError, GitError, InvalidRevisionError, RevisionNotFoundError
+from reporewind.errors import (
+    ConfigError,
+    GitError,
+    InvalidRevisionError,
+    PatchApplyError,
+    RevisionNotFoundError,
+)
 from reporewind.models import CommitInfo, check_repo_path, is_full_sha
 from reporewind.proc import CommandResult, CommandRunner, SubprocessRunner
 
@@ -128,8 +135,9 @@ class Git:
         self.runner: CommandRunner = runner or SubprocessRunner()
         self.executable = executable
         self.timeout = timeout
+        self._user_env = dict(env or {})
         self._env = hermetic_env(
-            extra={"GIT_CEILING_DIRECTORIES": str(self.repo_dir.parent), **(env or {})}
+            extra={"GIT_CEILING_DIRECTORIES": str(self.repo_dir.parent), **self._user_env}
         )
 
     def __repr__(self) -> str:
@@ -329,6 +337,106 @@ class Git:
         """Every file path in the tree of ``rev``, sorted, relative to the root."""
         out = self._text("ls-tree", "-r", "-z", "--name-only", "--full-tree", self.rev_parse(rev))
         return tuple(sorted(name for name in out.split("\x00") if name))
+
+    # -- work trees and patches --------------------------------------------------
+
+    def _sibling(self, repo_dir: Path) -> Git:
+        """A wrapper for another directory sharing this one's runner and settings."""
+        return Git(
+            repo_dir,
+            runner=self.runner,
+            executable=self.executable,
+            timeout=self.timeout,
+            env=self._user_env,
+        )
+
+    def checkout_detached(self, rev: str, work_dir: Path | str) -> Git:
+        """Check out ``rev`` with a detached HEAD into a new linked worktree.
+
+        ``work_dir`` must be missing or empty. The worktree shares this
+        repository's object store (bare repositories work too), so it costs one
+        checkout, not one clone. Returns a :class:`Git` for the worktree.
+        """
+        sha = self.rev_parse(rev)
+        target = Path(work_dir).resolve()
+        if target.exists() and (not target.is_dir() or any(target.iterdir())):
+            raise ConfigError(f"work dir {target} must be missing or an empty directory")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self.run("worktree", "add", "--quiet", "--detach", "--", str(target), sha)
+        return self._sibling(target)
+
+    def remove_worktree(self, work_dir: Path | str) -> None:
+        """Delete a linked worktree, including local changes, and prune its metadata."""
+        target = Path(work_dir).resolve()
+        if target.exists():
+            self.run("worktree", "remove", "--force", "--force", "--", str(target))
+        self.run("worktree", "prune")
+
+    @contextmanager
+    def worktree(self, rev: str, work_dir: Path | str) -> Iterator[Git]:
+        """Context manager around :meth:`checkout_detached` that always cleans up."""
+        tree = self.checkout_detached(rev, work_dir)
+        try:
+            yield tree
+        finally:
+            self.remove_worktree(work_dir)
+
+    def _require_work_tree(self) -> None:
+        # In a bare repository `git apply` would write into the git dir itself.
+        result = self.run("rev-parse", "--is-inside-work-tree", check=False)
+        if result.stdout_text.strip() != "true":
+            raise ConfigError(f"{self.repo_dir} has no work tree; use checkout_detached first")
+
+    def _apply(self, patch: str, *, check_only: bool, reverse: bool) -> None:
+        self._require_work_tree()
+        args = ["apply", "--whitespace=nowarn"]
+        if check_only:
+            args.append("--check")
+        if reverse:
+            args.append("--reverse")
+        # surrogateescape restores any non-UTF-8 bytes captured by diff().
+        data = patch.encode("utf-8", "surrogateescape")
+        self.run(*args, "-", stdin=data, error=PatchApplyError)
+
+    def apply_check(self, patch: str, *, reverse: bool = False) -> None:
+        """Raise :class:`PatchApplyError` unless ``patch`` applies cleanly; change nothing."""
+        self._apply(patch, check_only=True, reverse=reverse)
+
+    def can_apply(self, patch: str, *, reverse: bool = False) -> bool:
+        """True if ``patch`` would apply cleanly to the work tree."""
+        try:
+            self.apply_check(patch, reverse=reverse)
+        except PatchApplyError:
+            return False
+        return True
+
+    def apply(self, patch: str, *, reverse: bool = False) -> None:
+        """Apply ``patch`` to the work tree (not the index), all or nothing.
+
+        ``git apply`` is atomic: if any hunk fails nothing is written, and it
+        refuses paths that leave the work tree or pass through a symlink.
+        """
+        self._apply(patch, check_only=False, reverse=reverse)
+
+    def reset_work_tree(self) -> None:
+        """Discard every change: tracked edits, untracked and ignored files."""
+        self._require_work_tree()
+        self.run("reset", "--quiet", "--hard", "HEAD")
+        self.run("clean", "--quiet", "--force", "-d", "-x")
+
+    def changed_paths(self) -> tuple[str, ...]:
+        """Paths that differ from HEAD in the work tree (including untracked), sorted."""
+        out = self._text("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        paths: set[str] = set()
+        entries = iter(out.split("\x00"))
+        for entry in entries:
+            if not entry:
+                continue
+            status, path = entry[:2], entry[3:]
+            paths.add(path)
+            if "R" in status or "C" in status:
+                paths.add(next(entries))  # the rename/copy source follows
+        return tuple(sorted(paths))
 
 
 __all__ = ["ALLOWED_PROTOCOLS", "DEFAULT_TIMEOUT", "Git", "check_revision", "hermetic_env"]
